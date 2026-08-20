@@ -1,0 +1,13 @@
+.DS_Store
+
+# Terraform
+.terraform/
+.terraform-*/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+secrets.*.tfvars
+envs/state/

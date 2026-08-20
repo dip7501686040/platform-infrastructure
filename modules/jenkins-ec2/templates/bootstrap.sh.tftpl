@@ -1,0 +1,111 @@
+#!/bin/bash
+set -uxo pipefail
+
+log() { echo "[bootstrap] $*"; }
+
+# Real AWS EC2 instances boot with systemd as PID 1; Floci's EC2 emulation
+# runs the "instance" as a plain container with no init system. Same script
+# either way — just fall back to launching services directly when systemd
+# isn't available, confirmed empirically against Floci (see terraform
+# plan history: nested dockerd runs fine there, just without systemd).
+has_systemd() {
+  [ -d /run/systemd/system ]
+}
+
+# --- Base tools ---
+dnf install -y aws-cli
+
+# --- Docker ---
+dnf install -y docker
+
+# Floci's own ECR emulation serves plain HTTP on the Docker bridge network
+# (real AWS ECR is always HTTPS, so this never matches there — harmless on
+# real AWS, needed for Floci's push/pull to work at all).
+mkdir -p /etc/docker
+cat >/etc/docker/daemon.json <<'DAEMON_JSON'
+{
+  "insecure-registries": ["172.17.0.0/16"]
+}
+DAEMON_JSON
+
+if has_systemd; then
+  systemctl enable --now docker
+else
+  log "no systemd — starting dockerd directly"
+  nohup dockerd >/var/log/dockerd.log 2>&1 &
+  for _ in $(seq 1 30); do
+    [ -S /var/run/docker.sock ] && break
+    sleep 1
+  done
+fi
+
+# --- Jenkins ---
+# Installed as separate dnf transactions, not one combined
+# `dnf install -y java wget git` — a single failed dependency (e.g. an
+# optional X11 lib pulled in by the JDK, unneeded on a headless box) fails
+# the *whole* transaction atomically, blocking wget/git too even though
+# they have nothing to do with it. --setopt=install_weak_deps=False on the
+# JDK install skips exactly that kind of unneeded weak dependency.
+dnf install -y wget git
+dnf install -y --setopt=install_weak_deps=False java-21-amazon-corretto
+wget -O /etc/yum.repos.d/jenkins.repo https://pkg.jenkins.io/rpm-stable/jenkins.repo
+rpm --import https://pkg.jenkins.io/rpm-stable/jenkins.io-2023.key
+dnf install -y jenkins
+
+# Let Jenkins run docker builds without sudo.
+usermod -aG docker jenkins || true
+
+JENKINS_HOME=/var/lib/jenkins
+JENKINS_WAR=/usr/share/java/jenkins.war
+mkdir -p "$JENKINS_HOME/init.groovy.d" "$JENKINS_HOME/plugins"
+
+# --- Pre-install plugins BEFORE Jenkins ever boots ---
+# The job-seeding script (WorkflowJob/GitSCM classes) and the
+# credential-seeding script (credentials-impl classes) both get
+# compiled/executed during Jenkins' own early init sequence — before any
+# post-boot REST API call could install plugins. So plugins have to
+# already be on disk in $JENKINS_HOME/plugins by the time Jenkins starts,
+# not installed afterward (confirmed empirically: a post-boot REST
+# install left both failing with "unable to resolve class" errors, since
+# neither plugin was loaded yet at the point they're needed).
+PLUGIN_MANAGER_JAR=/tmp/jenkins-plugin-manager.jar
+PLUGIN_MANAGER_URL=$(curl -s https://api.github.com/repos/jenkinsci/plugin-installation-manager-tool/releases/latest | grep -o '"browser_download_url": *"[^"]*\.jar"' | cut -d'"' -f4)
+wget -O "$PLUGIN_MANAGER_JAR" "$PLUGIN_MANAGER_URL"
+java -jar "$PLUGIN_MANAGER_JAR" --war "$JENKINS_WAR" \
+  --plugin-download-directory "$JENKINS_HOME/plugins" \
+  --plugins git workflow-aggregator credentials-binding credentials
+
+# --- Configuration as Code: skip the setup wizard, seed the admin
+# account and (if provided) the git push credential, and pre-seed one
+# generic + one per-service pipeline job — so every fresh instance is
+# immediately ready for CI with zero manual setup, rather than needing
+# the plugin/job/credential dance redone by hand after every recreation.
+#
+# Jobs are created programmatically (Groovy, via Jenkins' own item API)
+# rather than as pre-rendered config.xml files: with one job per service
+# (13+), embedding full XML for each blows past EC2's 16KB user_data
+# limit — a real AWS constraint, not a Floci-only workaround — while a
+# Groovy loop stays a fixed, small size regardless of service count.
+cat >"$JENKINS_HOME/init.groovy.d/basic-security.groovy" <<'INIT_GROOVY'
+${init_security_groovy}
+INIT_GROOVY
+
+cat >"$JENKINS_HOME/init.groovy.d/seed-jobs.groovy" <<'SEED_JOBS_GROOVY'
+${seed_jobs_groovy}
+SEED_JOBS_GROOVY
+
+chown -R jenkins:jenkins "$JENKINS_HOME"
+
+JAVA_OPTS_COMMON="-Djenkins.install.runSetupWizard=false"
+
+if has_systemd; then
+  mkdir -p /etc/sysconfig
+  if [ -f /etc/sysconfig/jenkins ]; then
+    sed -i "s|^JENKINS_JAVA_OPTIONS=.*|JENKINS_JAVA_OPTIONS=\"$JAVA_OPTS_COMMON\"|" /etc/sysconfig/jenkins
+  fi
+  systemctl enable --now jenkins
+else
+  log "no systemd — starting jenkins directly"
+  JENKINS_HOME=$JENKINS_HOME nohup runuser -u jenkins -- java $JAVA_OPTS_COMMON -jar "$JENKINS_WAR" --httpPort=8080 \
+    >/var/log/jenkins.log 2>&1 &
+fi

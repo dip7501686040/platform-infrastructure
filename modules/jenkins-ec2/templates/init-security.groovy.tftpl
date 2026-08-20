@@ -1,0 +1,33 @@
+import jenkins.model.*
+import hudson.security.*
+import com.cloudbees.plugins.credentials.*
+import com.cloudbees.plugins.credentials.domains.*
+import com.cloudbees.plugins.credentials.impl.*
+
+def instance = Jenkins.get()
+
+def hudsonRealm = new HudsonPrivateSecurityRealm(false)
+hudsonRealm.createAccount("admin", "${admin_password}")
+instance.setSecurityRealm(hudsonRealm)
+
+def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+strategy.setAllowAnonymousRead(false)
+instance.setAuthorizationStrategy(strategy)
+
+instance.save()
+
+%{ if github_push_token != "" }
+def credsStore = SystemCredentialsProvider.getInstance().getStore()
+def domain = Domain.global()
+def alreadyExists = credsStore.getCredentials(domain).any { it.id == "github-push" }
+if (!alreadyExists) {
+  def cred = new UsernamePasswordCredentialsImpl(
+    CredentialsScope.GLOBAL,
+    "github-push",
+    "GitHub push credential for CI tag-bump commits to platform-gitops",
+    "${github_push_username}",
+    "${github_push_token}"
+  )
+  credsStore.addCredentials(domain, cred)
+}
+%{ endif }

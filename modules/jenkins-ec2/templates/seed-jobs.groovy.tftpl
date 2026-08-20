@@ -1,0 +1,98 @@
+import jenkins.model.*
+import hudson.model.*
+import org.jenkinsci.plugins.workflow.job.WorkflowJob
+import org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition
+import hudson.plugins.git.GitSCM
+import hudson.plugins.git.UserRemoteConfig
+import hudson.plugins.git.BranchSpec
+
+def jenkins = Jenkins.get()
+def repoUrl = "${git_repo_url}"
+def branch = "${git_branch}"
+def services = [${services_groovy_list}]
+
+def makeScm = {
+  // credentialsId null: platform-gitops is public, anonymous clone is fine
+  // for read. Only the tag-bump push (see Jenkinsfile) needs the
+  // github-push credential.
+  new GitSCM(
+    [new UserRemoteConfig(repoUrl, null, null, null)],
+    [new BranchSpec("*/" + branch)],
+    false, [],
+    null, null, []
+  )
+}
+
+def createOrUpdateJob = { name, description, paramsDef, scriptPath = "jenkins/Jenkinsfile", scm = null ->
+  def job = jenkins.getItem(name)
+  if (job == null) {
+    job = jenkins.createProject(WorkflowJob.class, name)
+  }
+  job.setDescription(description)
+  def flowDef = new CpsScmFlowDefinition(scm ?: makeScm(), scriptPath)
+  flowDef.setLightweight(true)
+  job.setDefinition(flowDef)
+  if (paramsDef != null) {
+    job.removeProperty(ParametersDefinitionProperty.class)
+    job.addProperty(paramsDef)
+  }
+  job.save()
+  return job
+}
+
+// ai-notification-system, not platform-gitops — this one job's primary
+// SCM has to be the source repo, since GIT_PREVIOUS_SUCCESSFUL_COMMIT
+// (used by its Jenkinsfile's turbo --filter) is only populated for a
+// job's primary checkout, never a secondary dir('src'){git ...} one.
+def sourceRepoScm = new GitSCM(
+  [new UserRemoteConfig("https://github.com/dip7501686040/ai-notification-system.git", null, null, null)],
+  [new BranchSpec("*/main")],
+  false, [],
+  null, null, []
+)
+
+// Generic/manual-override job — SERVICES accepts a comma-separated list
+// or "all", nothing pinned.
+createOrUpdateJob(
+  "build-service",
+  "CI: build/push any service(s) and bump image tags in git. Generic/manual-override job — for a pre-ready single-click build of one specific service, use the build-<service> jobs instead.",
+  null
+)
+
+// One pre-ready, one-click job per service — same Jenkinsfile/repo/branch,
+// differing only in a pinned SERVICES default so no parameters need
+// typing. Regenerated from var.service_names every apply.
+services.each { svc ->
+  def params = new ParametersDefinitionProperty([
+    new ChoiceParameterDefinition("ENVIRONMENT", ["local", "prod"] as String[], "Which k8s/environments/<env> to update"),
+    new StringParameterDefinition("SERVICES", svc, "Pinned to " + svc + " — override only for an ad-hoc different run"),
+    new StringParameterDefinition("WEB_API_URL", "", "Overrides web's NEXT_PUBLIC_API_URL build-arg"),
+  ])
+  createOrUpdateJob("build-" + svc, "CI: build/push " + svc + " and bump its image tag in git", params)
+}
+
+// Primary SCM is ai-notification-system itself (see sourceRepoScm above),
+// using Jenkins' built-in pollSCM trigger (declarative triggers{} block in
+// that repo's own Jenkinsfile) — turbo --filter decides which packages
+// are actually affected, dependency-graph aware, and triggers
+// build-<service> one at a time only for those.
+def watchJob = createOrUpdateJob(
+  "watch-source-and-build",
+  "CI: polls ai-notification-system main; turbo determines which packages are actually affected, then triggers build-<service> one at a time for those only.",
+  new ParametersDefinitionProperty([
+    new ChoiceParameterDefinition("ENVIRONMENT", ["local", "prod"] as String[], "Which environment build-<service> should deploy to"),
+  ]),
+  "Jenkinsfile",
+  sourceRepoScm
+)
+
+// A declarative triggers{} block only gets registered with Jenkins'
+// scheduler *after* the Jenkinsfile has actually run once — so trigger
+// that first run here, at seed time, instead of requiring a manual
+// "Build Now" click on every fresh instance. This run just records the
+// current commit as its baseline (see the Jenkinsfile's own
+// GIT_PREVIOUS_SUCCESSFUL_COMMIT check) and registers the poll schedule;
+// it doesn't build anything.
+watchJob.scheduleBuild2(0)
+
+jenkins.save()
