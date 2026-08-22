@@ -694,18 +694,24 @@ resource "terraform_data" "jenkins_tunnel" {
       #
       # Double-fork daemonize, not plain nohup or a single setsid() --
       # confirmed live, when this runs as a step in a GitHub Actions
-      # self-hosted runner job (Phase 4), the runner's job-completion
-      # cleanup kept killing the tunnel even after switching to
-      # setsid()+execvp. Root cause: that cleanup walks the *process tree*
-      # by PPID, and setsid() alone changes the session/process group, not
-      # PPID -- only actually being reparented to init/launchd escapes a
-      # PPID-based tree walk, and that reparenting only happens once a
-      # process's immediate parent has exited. The classic double-fork
-      # daemonize idiom forces exactly that: the first fork's parent exits
-      # right away (triggering the grandchild's reparent to launchd), and
-      # the second fork on top guarantees it can never reacquire a
-      # controlling terminal either. Confirmed live this survives a runner
-      # job ending, where the single-setsid version didn't.
+      # self-hosted runner job (Phase 4), the runner killed the tunnel
+      # every time the job finished, and neither setsid() nor a proper
+      # double-fork daemonize (reparenting confirmed live via `ps -o
+      # ppid` showing 1) stopped it. The runner's own diagnostic log gave
+      # the real reason: "Cleaning up orphan processes" / "Terminate
+      # orphan process: pid (N) (kubectl)" -- it doesn't walk the process
+      # tree or process group at all, it scans *every* process on the
+      # system and kills any whose environment still carries the
+      # RUNNER_TRACKING_ID it stamps onto everything a job spawns. No
+      # amount of session/parent detachment escapes that, since fork()
+      # and execvp() both inherit the parent's environment unless told
+      # otherwise. The fix that actually works: strip that (and other
+      # RUNNER_*/GITHUB_*/ACTIONS_* job-tracking) vars before the final
+      # exec, via execvpe with an explicit filtered environment instead
+      # of plain execvp -- kubectl doesn't need any of them anyway. Kept
+      # the double-fork daemonize underneath regardless (harmless, and
+      # still the correct way to detach a long-lived process from a
+      # short-lived shell in general).
       #
       # No trailing `&`/`echo $!` here on purpose: the shell already
       # returns as soon as the first fork's parent exits (which is
@@ -721,7 +727,8 @@ if os.fork() > 0:
     sys.exit(0)
 with open('$PIDFILE', 'w') as f:
     f.write(str(os.getpid()))
-os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/jenkins', '-n', 'jenkins', '${var.jenkins_local_tunnel_port}:8080'])
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/jenkins', '-n', 'jenkins', '${var.jenkins_local_tunnel_port}:8080'], env)
 " </dev/null >/dev/null 2>&1
 
       echo "Jenkins UI: http://localhost:${var.jenkins_local_tunnel_port}"
@@ -792,8 +799,12 @@ resource "terraform_data" "web_tunnel" {
         sleep 2
       done
 
-      # Double-fork daemonize, not plain nohup -- see jenkins_tunnel's
-      # comment for the full story on why.
+      # Double-fork daemonize + a filtered exec environment -- see
+      # jenkins_tunnel's comment for the full story on why (short version:
+      # the GitHub Actions runner kills orphaned processes by scanning for
+      # a RUNNER_TRACKING_ID env var, not by process tree/group, so that
+      # var has to be stripped before the final exec, not just detached
+      # from the process tree).
       python3 -c "
 import os, sys
 if os.fork() > 0:
@@ -803,7 +814,8 @@ if os.fork() > 0:
     sys.exit(0)
 with open('$PIDFILE', 'w') as f:
     f.write(str(os.getpid()))
-os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/web', '-n', 'ai-notification', '${var.app_local_tunnel_port}:3000'])
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/web', '-n', 'ai-notification', '${var.app_local_tunnel_port}:3000'], env)
 " </dev/null >/dev/null 2>&1
 
       echo "Web app: http://localhost:${var.app_local_tunnel_port}"
@@ -868,8 +880,12 @@ resource "terraform_data" "argocd_tunnel" {
         sleep 2
       done
 
-      # Double-fork daemonize, not plain nohup -- see jenkins_tunnel's
-      # comment for the full story on why.
+      # Double-fork daemonize + a filtered exec environment -- see
+      # jenkins_tunnel's comment for the full story on why (short version:
+      # the GitHub Actions runner kills orphaned processes by scanning for
+      # a RUNNER_TRACKING_ID env var, not by process tree/group, so that
+      # var has to be stripped before the final exec, not just detached
+      # from the process tree).
       python3 -c "
 import os, sys
 if os.fork() > 0:
@@ -879,7 +895,8 @@ if os.fork() > 0:
     sys.exit(0)
 with open('$PIDFILE', 'w') as f:
     f.write(str(os.getpid()))
-os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/argocd-server', '-n', 'argocd', '${var.argocd_local_tunnel_port}:443'])
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/argocd-server', '-n', 'argocd', '${var.argocd_local_tunnel_port}:443'], env)
 " </dev/null >/dev/null 2>&1
 
       echo "ArgoCD UI: https://localhost:${var.argocd_local_tunnel_port} (admin / see 'argocd admin initial-password')"
