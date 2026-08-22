@@ -79,6 +79,64 @@ resource "terraform_data" "ensure_restart_policies" {
   }
 }
 
+# Floci-only: containerd (inside the k3s node) defaults to HTTPS for any
+# registry host it has no explicit config for, but floci-ecr-registry is
+# plain unauthenticated HTTP -- confirmed live, every image pull failed
+# with "server gave HTTP response to HTTPS client" against the registry's
+# own bridge-internal IP (the same address kaniko pushes to from inside a
+# pod -- see jenkins/env/local.properties in platform-gitops for why pods
+# and the node resolve this registry differently). Floci's own
+# registries.yaml ships mirrors for a stable `localhost:5100`-style alias,
+# but that alias only resolves at all via Docker's embedded DNS, which
+# doesn't exist on the plain default "bridge" network these containers
+# sit on -- confirmed live too, `no such host`. The fix that actually
+# works: a self-referencing mirror keyed on the registry's *current*
+# bridge IP, forcing plain HTTP for exactly the address pulls already use.
+# k3s only reads registries.yaml at startup, not on a hot reload, so
+# patching it only has an effect together with a restart -- done here,
+# but ONLY when the current IP isn't already covered, so a routine apply
+# where nothing drifted doesn't pay for a restart it doesn't need.
+resource "terraform_data" "ensure_registry_pull_mirror" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.ensure_restart_policies]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      CONTAINER="floci-eks-${module.eks.cluster_name}"
+      REGISTRY_IP=$(docker inspect floci-ecr-registry --format '{{.NetworkSettings.Networks.bridge.IPAddress}}' 2>/dev/null || true)
+      if [ -z "$REGISTRY_IP" ]; then
+        echo "floci-ecr-registry not found yet -- skipping (nothing to mirror)."
+        exit 0
+      fi
+
+      if docker exec "$CONTAINER" grep -q "\"$REGISTRY_IP:5000\":" /etc/rancher/k3s/registries.yaml 2>/dev/null; then
+        echo "registries.yaml already has a working mirror for $REGISTRY_IP:5000 -- nothing to do."
+        exit 0
+      fi
+
+      echo "registries.yaml is missing a mirror for the current registry IP ($REGISTRY_IP) -- patching and restarting k3s to pick it up..."
+      docker exec "$CONTAINER" sh -c "sed -i '1a\\
+  \"$REGISTRY_IP:5000\":\\
+    endpoint:\\
+      - \"http://$REGISTRY_IP:5000\"' /etc/rancher/k3s/registries.yaml"
+      docker restart "$CONTAINER" >/dev/null
+
+      echo "waiting for k3s to come back up..."
+      for i in $(seq 1 60); do
+        docker exec "$CONTAINER" test -f /etc/rancher/k3s/k3s.yaml 2>/dev/null && break
+        sleep 2
+      done
+    EOT
+  }
+}
+
 # Floci-only: k3s (inside the floci-eks-<cluster> container) registers a
 # brand-new Node identity essentially every time its process restarts, not
 # just when the container itself is recreated. The old Node never gets a
@@ -95,7 +153,11 @@ resource "terraform_data" "ensure_restart_policies" {
 resource "terraform_data" "k8s_reconcile" {
   count = var.manage_floci ? 1 : 0
 
-  depends_on = [module.eks]
+  # ensure_registry_pull_mirror, not just module.eks: that resource can
+  # restart the k3s node container to pick up a registries.yaml fix, and
+  # everything from here on needs to run against the node that's actually
+  # up afterward, not one that's mid-restart underneath it.
+  depends_on = [terraform_data.ensure_registry_pull_mirror]
 
   # Re-run on every single apply, not just when something in the module.eks
   # graph changed — the whole point is to catch node/pod churn that happened
