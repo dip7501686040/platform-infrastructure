@@ -692,23 +692,37 @@ resource "terraform_data" "jenkins_tunnel" {
       # `echo $!` into the PIDFILE still succeeds and `terraform apply`
       # still reports success, with nothing actually left listening.
       #
-      # python3 os.setsid()+execvp, not plain nohup -- confirmed live, when
-      # this runs as a step in a GitHub Actions self-hosted runner job
-      # (Phase 4), the runner kills the whole process group it spawned for
-      # the job once the job completes, and plain nohup/disown don't
-      # escape that (nohup only blocks SIGHUP, and the child still belongs
-      # to the job's process group either way) -- the tunnel died the
-      # instant the workflow run finished. os.setsid() puts the process in
-      # a genuinely new session/process group the runner's cleanup can't
-      # reach; execvp replaces the python process image with kubectl in
-      # place (same PID throughout), so $! below still captures the real
-      # port-forward PID exactly like it did with plain nohup.
+      # Double-fork daemonize, not plain nohup or a single setsid() --
+      # confirmed live, when this runs as a step in a GitHub Actions
+      # self-hosted runner job (Phase 4), the runner's job-completion
+      # cleanup kept killing the tunnel even after switching to
+      # setsid()+execvp. Root cause: that cleanup walks the *process tree*
+      # by PPID, and setsid() alone changes the session/process group, not
+      # PPID -- only actually being reparented to init/launchd escapes a
+      # PPID-based tree walk, and that reparenting only happens once a
+      # process's immediate parent has exited. The classic double-fork
+      # daemonize idiom forces exactly that: the first fork's parent exits
+      # right away (triggering the grandchild's reparent to launchd), and
+      # the second fork on top guarantees it can never reacquire a
+      # controlling terminal either. Confirmed live this survives a runner
+      # job ending, where the single-setsid version didn't.
+      #
+      # No trailing `&`/`echo $!` here on purpose: the shell already
+      # returns as soon as the first fork's parent exits (which is
+      # immediate), and only the fully-detached grandchild -- invisible to
+      # this shell's own $! -- knows its own final PID, so it writes the
+      # PIDFILE itself instead.
       python3 -c "
-import os
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
 os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
 os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/jenkins', '-n', 'jenkins', '${var.jenkins_local_tunnel_port}:8080'])
-" </dev/null >/dev/null 2>&1 &
-      echo $! > "$PIDFILE"
+" </dev/null >/dev/null 2>&1
 
       echo "Jenkins UI: http://localhost:${var.jenkins_local_tunnel_port}"
     EOT
@@ -778,14 +792,19 @@ resource "terraform_data" "web_tunnel" {
         sleep 2
       done
 
-      # </dev/null is load-bearing, and python3 os.setsid()+execvp instead
-      # of plain nohup -- see jenkins_tunnel's comment for why on both.
+      # Double-fork daemonize, not plain nohup -- see jenkins_tunnel's
+      # comment for the full story on why.
       python3 -c "
-import os
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
 os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
 os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/web', '-n', 'ai-notification', '${var.app_local_tunnel_port}:3000'])
-" </dev/null >/dev/null 2>&1 &
-      echo $! > "$PIDFILE"
+" </dev/null >/dev/null 2>&1
 
       echo "Web app: http://localhost:${var.app_local_tunnel_port}"
     EOT
@@ -849,14 +868,19 @@ resource "terraform_data" "argocd_tunnel" {
         sleep 2
       done
 
-      # python3 os.setsid()+execvp instead of plain nohup -- see
-      # jenkins_tunnel's comment for why.
+      # Double-fork daemonize, not plain nohup -- see jenkins_tunnel's
+      # comment for the full story on why.
       python3 -c "
-import os
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
 os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
 os.execvp('kubectl', ['kubectl', 'port-forward', 'svc/argocd-server', '-n', 'argocd', '${var.argocd_local_tunnel_port}:443'])
-" </dev/null >/dev/null 2>&1 &
-      echo $! > "$PIDFILE"
+" </dev/null >/dev/null 2>&1
 
       echo "ArgoCD UI: https://localhost:${var.argocd_local_tunnel_port} (admin / see 'argocd admin initial-password')"
     EOT
