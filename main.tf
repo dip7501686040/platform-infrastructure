@@ -53,33 +53,18 @@ module "addons" {
   tags               = var.tags
 }
 
-module "jenkins_ec2" {
-  count      = var.jenkins_mode == "ec2" ? 1 : 0
-  source     = "./modules/jenkins-ec2"
-  depends_on = [module.floci]
+# Makes the previously-manual "docker update --restart=unless-stopped on
+# floci-eks-*" fix permanent instead of something that silently lapses
+# whenever the container gets replaced. Floci already sets this on
+# floci-ecr-registry itself; only the EKS emulation container it creates
+# internally needs catching up. With this plus FLOCI_STORAGE_MODE=persistent
+# (modules/floci), every floci-* container auto-restarts together when
+# Docker Desktop (re)starts, and Floci actually remembers what it had
+# created -- no manual `docker start` step after a reboot.
+resource "terraform_data" "ensure_restart_policies" {
+  count = var.manage_floci ? 1 : 0
 
-  instance_type        = var.jenkins_instance_type
-  admin_cidr           = var.jenkins_admin_cidr
-  vpc_id               = module.network.vpc_id
-  subnet_id            = module.network.public_subnet_ids[0]
-  github_push_username = var.github_push_username
-  github_push_token    = var.github_push_token
-  service_names        = var.ecr_repository_names
-  tags                 = var.tags
-}
-
-# Floci-only: when aws_instance.jenkins gets replaced, Floci's own
-# "terminate" doesn't reliably remove the old floci-ec2-<id> Docker
-# container -- it's been observed sitting around, still running, long
-# after Terraform moved on to a new instance ID. Left alone, that's not
-# just clutter: a stale container can still be holding the SSH port the
-# new one needs, which is exactly what caused the "unexpected state
-# 'terminated'" failures earlier. Removes anything matching floci-ec2-*
-# that isn't the currently tracked instance, every apply.
-resource "terraform_data" "cleanup_stale_ec2_containers" {
-  count = (var.manage_floci && var.jenkins_mode == "ec2") ? 1 : 0
-
-  depends_on = [module.jenkins_ec2]
+  depends_on = [module.eks]
 
   triggers_replace = {
     always_run = timestamp()
@@ -89,140 +74,28 @@ resource "terraform_data" "cleanup_stale_ec2_containers" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      CURRENT="floci-ec2-${module.jenkins_ec2[0].instance_id}"
-      for c in $(docker ps -a --format '{{.Names}}' | grep '^floci-ec2-' || true); do
-        if [ "$c" != "$CURRENT" ]; then
-          echo "removing stale EC2 container $c (current is $CURRENT)"
-          docker rm -f "$c" || true
-        fi
-      done
+      docker update --restart=unless-stopped "floci-eks-${module.eks.cluster_name}" >/dev/null
     EOT
   }
-}
-
-# Browser access to the Jenkins UI from this Mac, without re-running any
-# manual port-forward by hand after every apply. An SSH local-forward
-# rather than relying on how Floci happens to publish container ports —
-# works the same way against real AWS too (jenkins_admin_cidr there is
-# meant to stay locked down, so a tunnel through the already-open SSH port
-# is the point, not a workaround). Opt-in via jenkins_local_tunnel_port so
-# a plain `terraform apply` on a CI box never tries to spawn one.
-resource "terraform_data" "jenkins_ssh_tunnel" {
-  count = (var.jenkins_mode == "ec2" && var.jenkins_local_tunnel_port > 0) ? 1 : 0
-
-  # Any change here tears down the old tunnel (destroy provisioner) and
-  # opens a fresh one (create provisioner) — covers instance replacement
-  # (new IP) and simply changing the desired local port.
-  triggers_replace = {
-    public_ip  = module.jenkins_ec2[0].public_ip
-    local_port = var.jenkins_local_tunnel_port
-    key_path   = module.jenkins_ec2[0].ssh_private_key_path
-    # public_ip alone isn't enough to detect a replaced instance: Floci
-    # always reports 127.0.0.1 regardless of which underlying container it
-    # is, so without instance_id here a replaced instance (new container,
-    # new Floci-assigned SSH port) silently leaves the tunnel pointed at
-    # the old, now-gone port.
-    instance_id = module.jenkins_ec2[0].instance_id
-    # Bump this whenever the provisioner script body below changes —
-    # terraform_data only re-runs provisioners on replace, and replacement
-    # is driven solely by this map, not by the script text itself.
-    script_version = 3
-    # Re-run on every apply, not just when the inputs above change: the
-    # actual ssh process can die independently (killed by hand, laptop
-    # sleep, anything) with none of those inputs ever changing, silently
-    # leaving Jenkins unreachable until something forces a replace. Same
-    # self-healing-every-apply pattern as k8s_reconcile/argocd_install/
-    # argocd_manifests/app_secrets below.
-    always_run = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -e
-      PIDFILE="${path.root}/envs/state/jenkins-tunnel-${var.jenkins_local_tunnel_port}.pid"
-      HOST="${module.jenkins_ec2[0].public_ip}"
-      KEY="${module.jenkins_ec2[0].ssh_private_key_path}"
-      SSH_PORT=22
-      SSH_USER=ec2-user
-
-      %{if var.manage_floci}
-      # Floci's EC2 emulation is a plain amazonlinux:2023 container, not the
-      # real AMI's cloud-init — there's no ec2-user account at all, only
-      # root, which is who the generated key pair actually gets authorized
-      # for (confirmed via `docker exec ... cat /root/.ssh/authorized_keys`).
-      SSH_USER=root
-      CONTAINER="floci-ec2-${module.jenkins_ec2[0].instance_id}"
-      for i in $(seq 1 30); do
-        MAPPED=$(docker port "$CONTAINER" 22 2>/dev/null | head -1)
-        if [ -n "$MAPPED" ]; then
-          SSH_PORT="$${MAPPED##*:}"
-          break
-        fi
-        sleep 2
-      done
-      %{endif}
-
-      SSH_OPTS="-i $KEY -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-
-      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        sleep 1
-      fi
-
-      echo "waiting for sshd on $HOST:$SSH_PORT..."
-      for i in $(seq 1 60); do
-        if ssh $SSH_OPTS -o ConnectTimeout=3 -o BatchMode=yes "$SSH_USER@$HOST" true 2>/dev/null; then
-          break
-        fi
-        sleep 2
-      done
-
-      nohup ssh $SSH_OPTS -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -N \
-        -L ${var.jenkins_local_tunnel_port}:localhost:8080 "$SSH_USER@$HOST" \
-        >/dev/null 2>&1 &
-      echo $! > "$PIDFILE"
-
-      echo "Jenkins UI: http://localhost:${var.jenkins_local_tunnel_port}"
-    EOT
-  }
-
-
-  provisioner "local-exec" {
-    when        = destroy
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      PIDFILE="${path.root}/envs/state/jenkins-tunnel-${self.triggers_replace.local_port}.pid"
-      if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        rm -f "$PIDFILE"
-      fi
-    EOT
-  }
-
-  depends_on = [module.jenkins_ec2]
 }
 
 # Floci-only: k3s (inside the floci-eks-<cluster> container) registers a
 # brand-new Node identity essentially every time its process restarts, not
 # just when the container itself is recreated. The old Node never gets a
-# clean kubelet handoff, so its pods get stuck "Terminating" forever, and
-# any PVC bound to that old Node (local-path's PVs are hard node-affinity
-# pinned) becomes permanently unmountable. This doesn't fix *why* k3s does
-# that — it self-heals the fallout on every apply instead: force-delete
-# zombie Terminating pods, remove NotReady nodes, and delete any PVC whose
-# PV is pinned to a node that's no longer live (its StatefulSet recreates a
-# fresh one against the current node automatically).
+# clean kubelet handoff, so its pods get stuck "Terminating" (or, confirmed
+# live, sometimes "Unknown" instead -- same underlying stale-kubelet-handoff
+# cause, just a different status string depending on exactly where the
+# handoff broke) forever, and any PVC bound to that old Node (local-path's
+# PVs are hard node-affinity pinned) becomes permanently unmountable. This
+# doesn't fix *why* k3s does that — it self-heals the fallout on every apply
+# instead: force-delete zombie Terminating/Unknown pods, remove NotReady
+# nodes, and delete any PVC whose PV is pinned to a node that's no longer
+# live (its StatefulSet/Deployment recreates a fresh one against the
+# current node automatically).
 resource "terraform_data" "k8s_reconcile" {
   count = var.manage_floci ? 1 : 0
 
-  # module.jenkins_ec2 too, not just module.eks: this whole chain (through
-  # argocd_install, which starts 5 pods and needs real CPU to stabilize)
-  # would otherwise run concurrently with the Jenkins EC2 container coming
-  # up from nothing -- this machine can't handle that much at once (see
-  # the "unexpected state 'terminated'" / helm --wait timeout failures
-  # that happen when both run in parallel). Sequenced, not parallel.
-  depends_on = [module.eks, module.jenkins_ec2]
+  depends_on = [module.eks]
 
   # Re-run on every single apply, not just when something in the module.eks
   # graph changed — the whole point is to catch node/pod churn that happened
@@ -237,8 +110,8 @@ resource "terraform_data" "k8s_reconcile" {
       set -e
       source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
 
-      echo "cleaning up stale Terminating pods..."
-      kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Terminating"{print $2, $1}' | \
+      echo "cleaning up stale Terminating/Unknown pods..."
+      kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Terminating" || $4=="Unknown"{print $2, $1}' | \
         while read -r ns name; do
           kubectl delete pod "$name" -n "$ns" --grace-period=0 --force >/dev/null 2>&1 || true
         done
@@ -348,13 +221,36 @@ resource "terraform_data" "argocd_install" {
       set -e
       source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
 
+      # Idempotency check: skip the helm upgrade (chart re-render, repo
+      # update over the network, --wait polling) entirely when ArgoCD is
+      # already deployed with this exact values file and healthy. Without
+      # this, every single apply paid the full cost of a helm upgrade
+      # regardless of whether anything actually changed -- real time and
+      # CPU on a machine that's already tight for it, for zero benefit.
+      # The values hash is stamped as an annotation on argocd-server right
+      # after a successful install/upgrade below, so this compares against
+      # what's *actually running*, not just Terraform's own state -- still
+      # self-healing if the deployment is missing, unhealthy, or was
+      # touched outside Terraform.
+      DEPLOYED_HASH=$(kubectl get deployment argocd-server -n argocd -o jsonpath='{.metadata.annotations.values-hash}' 2>/dev/null || true)
+      READY=$(kubectl get deployment argocd-server -n argocd -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$DEPLOYED_HASH" = "${filesha256("${var.platform_gitops_path}/k8s/argocd/values-core.yaml")}" ] && [ "$${READY:-0}" -ge 1 ]; then
+        echo "ArgoCD already deployed and healthy with unchanged values -- skipping helm upgrade."
+        exit 0
+      fi
+
+      source "${path.module}/scripts/helm-unstick.sh" "argocd" "argocd"
+
       helm repo add argo https://argoproj.github.io/argo-helm >/dev/null 2>&1 || true
       helm repo update argo >/dev/null 2>&1
 
       helm upgrade --install argocd argo/argo-cd \
         --namespace argocd --create-namespace \
         -f "${var.platform_gitops_path}/k8s/argocd/values-core.yaml" \
-        --wait --timeout 5m
+        --wait --timeout 10m
+
+      kubectl annotate deployment argocd-server -n argocd \
+        values-hash="${filesha256("${var.platform_gitops_path}/k8s/argocd/values-core.yaml")}" --overwrite
     EOT
   }
 }
@@ -387,6 +283,508 @@ resource "terraform_data" "argocd_manifests" {
 
       kubectl apply -f "${var.platform_gitops_path}/k8s/argocd/applications/"
       kubectl apply -f "${var.platform_gitops_path}/k8s/argocd/applicationsets/"
+    EOT
+  }
+}
+
+# Generated so Jenkins never needs the interactive setup wizard or a
+# fetch-from-pod initialAdminPassword dance -- admin/<this> works the
+# moment Jenkins is up. (Previously lived in modules/jenkins-ec2 -- moved
+# here now that Jenkins is a plain Helm install, not a submodule.)
+resource "random_password" "jenkins_admin" {
+  length  = 24
+  special = false
+}
+
+resource "local_sensitive_file" "jenkins_admin_password" {
+  content         = random_password.jenkins_admin.result
+  filename        = "${path.root}/envs/state/jenkins-admin-password.txt"
+  file_permission = "0600"
+}
+
+# Rendered to actual files (not embedded inline in the helm command below)
+# so `--set-file` can reference them directly -- avoids nesting a nested
+# shell heredoc inside Terraform's own heredoc, which gets fragile fast once
+# the content itself (Groovy, with its own ${...} syntax) has to survive
+# both Terraform's interpolation pass and the shell's.
+resource "local_sensitive_file" "jenkins_init_security" {
+  content = templatefile("${path.module}/templates/jenkins/init-security.groovy.tftpl", {
+    admin_password       = random_password.jenkins_admin.result
+    github_push_username = var.github_push_username
+    github_push_token    = var.github_push_token
+  })
+  filename        = "${path.root}/envs/state/jenkins-init-security.groovy"
+  file_permission = "0600"
+}
+
+resource "local_file" "jenkins_seed_jobs" {
+  content = templatefile("${path.module}/templates/jenkins/seed-jobs.groovy.tftpl", {
+    git_repo_url         = "https://github.com/dip7501686040/platform-gitops.git"
+    git_branch           = "main"
+    services_groovy_list = join(", ", [for s in var.ecr_repository_names : "\"${s}\""])
+  })
+  filename = "${path.root}/envs/state/jenkins-seed-jobs.groovy"
+}
+
+# Floci-only for now -- Jenkins as a Kubernetes workload instead of a
+# dedicated EC2/VM instance. Why: Floci's EC2 emulation has no systemd, so
+# nothing supervised Jenkins (or even sshd) once either died -- confirmed
+# live, repeatedly, across a full day of debugging -- and Floci's own EC2
+# instance state machine proved unreliable under normal Docker Desktop
+# restarts (stuck "pending", public IP never assigned, instances vanishing
+# outside Terraform's own view). Kubernetes gives Jenkins a Deployment's
+# restart guarantees for free and reuses the same kubectl-port-forward
+# pattern as the tunnel below instead of an SSH tunnel to a VM. Real-AWS
+# wiring (a real kubeconfig instead of scripts/kubeconfig.sh's Floci-only
+# docker-exec approach) is deferred prod work, same as Ingress/ALB browser
+# access -- see the plan notes this project keeps for that.
+#
+# Installed directly via helm (not GitOps/ArgoCD-managed), same reasoning as
+# argocd_install: platform/CI control plane, not an application -- and
+# having ArgoCD manage the very Jenkins that seeds ArgoCD's own sync targets
+# is an unnecessary chicken-and-egg for no real benefit. Sequenced after the
+# whole ArgoCD/backing-services chain, not parallel with it -- same "this
+# machine can't handle concurrent heavy installs" lesson as everything else
+# in this file.
+resource "terraform_data" "jenkins_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [
+    terraform_data.argocd_manifests,
+    local_sensitive_file.jenkins_init_security,
+    local_file.jenkins_seed_jobs,
+  ]
+
+  triggers_replace = {
+    always_run    = timestamp()
+    values_hash   = filesha256("${var.platform_gitops_path}/k8s/jenkins/values.yaml")
+    security_hash = local_sensitive_file.jenkins_init_security.content_sha256
+    seed_hash     = local_file.jenkins_seed_jobs.content_sha256
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      # Force-delete jenkins-0 first if it's stuck Terminating/Unknown --
+      # same stale-kubelet-handoff class of issue k8s_reconcile already
+      # cleans up elsewhere in this file, but that pass runs once, early,
+      # right after k3s comes back up -- before Jenkins (by far the
+      # slowest pod here to boot, a full JVM + plugin load) has had time to
+      # reveal its own staleness. Confirmed live: a StatefulSet with an
+      # unchanged, correct spec does NOT self-heal a pod merely stuck in
+      # "Unknown" -- the controller only replaces a pod once it's actually
+      # gone, not just stale, so without this the pod sat broken until
+      # someone noticed and deleted it by hand.
+      STUCK=$(kubectl get pod jenkins-0 -n jenkins --no-headers 2>/dev/null | awk '$3=="Unknown" || $3=="Terminating"{print $1}')
+      if [ -n "$STUCK" ]; then
+        echo "jenkins-0 is stuck ($STUCK) -- force-deleting so the StatefulSet recreates it..."
+        kubectl delete pod jenkins-0 -n jenkins --grace-period=0 --force >/dev/null 2>&1 || true
+      fi
+
+      # Idempotency check: skip the helm upgrade entirely when Jenkins is
+      # already deployed with this exact config and healthy -- confirmed
+      # live, re-running this unconditionally cost real time even when
+      # nothing changed (chart re-render, --wait polling, and worst case
+      # the full plugin-reinstall/pod-restart path this file's own comments
+      # already document as expensive). Combines all three hash inputs
+      # since any one of them changing means real content changed. Compares
+      # against what's actually running (an annotation stamped right after
+      # a successful install/upgrade below), not just Terraform's own
+      # state, so this stays self-healing if the StatefulSet is missing,
+      # unhealthy, or was touched outside Terraform.
+      DEPLOYED_HASH=$(kubectl get statefulset jenkins -n jenkins -o jsonpath='{.metadata.annotations.config-hash}' 2>/dev/null || true)
+      READY=$(kubectl get statefulset jenkins -n jenkins -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      CURRENT_HASH="${filesha256("${var.platform_gitops_path}/k8s/jenkins/values.yaml")}-${local_sensitive_file.jenkins_init_security.content_sha256}-${local_file.jenkins_seed_jobs.content_sha256}"
+      if [ "$DEPLOYED_HASH" = "$CURRENT_HASH" ] && [ "$${READY:-0}" -ge 1 ]; then
+        echo "Jenkins already deployed and healthy with unchanged config -- skipping helm upgrade."
+        exit 0
+      fi
+
+      source "${path.module}/scripts/helm-unstick.sh" "jenkins" "jenkins"
+
+      helm repo add jenkins https://charts.jenkins.io >/dev/null 2>&1 || true
+      helm repo update jenkins >/dev/null 2>&1
+
+      # 20m, not 10m: this chart's plugin init container re-downloads every
+      # plugin from the internet into an ephemeral (not JENKINS_HOME-backed)
+      # volume on every single pod (re)start -- confirmed live, a restart
+      # forced by an initScripts content change took ~13m end to end,
+      # blowing past a 10m --wait and leaving `terraform apply` erroring out
+      # even though the pod finished starting less than a minute later on
+      # its own. Not fixing the re-download-every-restart behavior itself
+      # here (that's its own, separate piece of work) -- just giving it
+      # enough runway to not race the timeout while it exists.
+      helm upgrade --install jenkins jenkins/jenkins \
+        --namespace jenkins --create-namespace \
+        -f "${var.platform_gitops_path}/k8s/jenkins/values.yaml" \
+        --set-file "controller.initScripts.basic-security=${local_sensitive_file.jenkins_init_security.filename}" \
+        --set-file "controller.initScripts.seed-jobs=${local_file.jenkins_seed_jobs.filename}" \
+        --wait --timeout 20m
+
+      kubectl annotate statefulset jenkins -n jenkins config-hash="$CURRENT_HASH" --overwrite
+    EOT
+  }
+}
+
+# Floci-only: a genuinely fresh cluster starts with empty ECR, so every app
+# pod sits in ImagePullBackOff until something builds and pushes all 13
+# service images once -- previously a manual "click the build-service job in
+# the Jenkins UI" step. Every apply: check whether ECR is still empty (a
+# fresh cluster) and if so, trigger the generic build-service job with
+# SERVICES=all and wait for it to finish. One job run, not 13 -- that job's
+# own Jenkinsfile already loops through every service sequentially, one
+# kaniko pod at a time (see platform-gitops/jenkins/Jenkinsfile's "Build +
+# push (kaniko, one service at a time)" stage), so there's no need to
+# reimplement that sequencing here or pay for a separate job/pod/git-clone
+# per service. No-ops immediately (checks one repo, exits) once ECR already
+# has images -- the common case on every apply after the first.
+resource "terraform_data" "seed_first_build" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.jenkins_install]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+
+      # Checked directly against the registry's own v2 API (port 5100 on
+      # the Mac host, published from floci-ecr-registry), not `aws ecr
+      # describe-images` -- confirmed live, Floci's ECR-metadata simulation
+      # came back completely empty after a Floci restart even though the
+      # underlying registry storage (and the repositories themselves) were
+      # fully intact, `docker exec floci-ecr-registry du -sh /var/lib/registry`
+      # still showing every layer. Trusting describe-images here would have
+      # silently triggered a full 13-service rebuild of images that already
+      # existed. The registry's own tags/list is what's actually true.
+      FIRST_REPO="ai-notification/${var.ecr_repository_names[0]}"
+      TAGS_JSON=$(curl -s "http://localhost:5100/v2/$FIRST_REPO/tags/list" 2>/dev/null)
+      if echo "$TAGS_JSON" | grep -q '"tags":\[[^]]'; then
+        echo "Registry already has images for $FIRST_REPO -- skipping first-build seed."
+        exit 0
+      fi
+
+      echo "ECR is empty -- seeding the first build via build-service (SERVICES=all)..."
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      JPORT=28080
+      JURL="http://localhost:$JPORT"
+      AUTH="admin:${random_password.jenkins_admin.result}"
+
+      # </dev/null is load-bearing -- see jenkins_tunnel's comment below for
+      # why. This port-forward only needs to live for the rest of this
+      # script, not across applies like jenkins_tunnel's does, so it's
+      # cleaned up via trap instead of a PID file.
+      kubectl port-forward svc/jenkins -n jenkins "$JPORT:8080" </dev/null >/dev/null 2>&1 &
+      JPID=$!
+      COOKIEJAR=$(mktemp)
+      trap 'kill $JPID 2>/dev/null || true; rm -f "$COOKIEJAR"' EXIT
+
+      echo "waiting for the Jenkins API..."
+      for i in $(seq 1 60); do
+        curl -sf -u "$AUTH" "$JURL/api/json" >/dev/null 2>&1 && break
+        sleep 2
+      done
+
+      # If a build is already running (e.g. a prior apply's trigger is
+      # still in flight -- this happens if that apply's own polling loop
+      # errored out for an unrelated reason, like the race described
+      # below), attach to it instead of triggering a wasteful, resource-
+      # competing duplicate.
+      LAST_JSON=$(curl -s -u "$AUTH" "$JURL/job/build-service/lastBuild/api/json" 2>/dev/null)
+      LAST_BUILDING=$(echo "$LAST_JSON" | grep -o '"building":[a-z]*' | head -1 | cut -d: -f2)
+      LAST_NUM=$(echo "$LAST_JSON" | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
+      [ -z "$LAST_NUM" ] && LAST_NUM=0
+
+      if [ "$LAST_BUILDING" = "true" ]; then
+        echo "build-service #$LAST_NUM is already running -- attaching to it instead of triggering a duplicate."
+        TARGET_NUM="$LAST_NUM"
+      else
+        # -c/-b share a cookie jar across both calls -- confirmed live, this
+        # crumb issuer ties the crumb to the session cookie it hands back,
+        # so a crumb fetched and then spent without carrying that same
+        # cookie forward gets rejected with "No valid crumb was included in
+        # the request" even though the crumb value itself is correct.
+        CRUMB=$(curl -s -c "$COOKIEJAR" -u "$AUTH" "$JURL/crumbIssuer/api/xml?xpath=concat(//crumbRequestField,%22:%22,//crumb)")
+        curl -sf -b "$COOKIEJAR" -u "$AUTH" -H "$CRUMB" -X POST "$JURL/job/build-service/buildWithParameters?ENVIRONMENT=local&SERVICES=all" >/dev/null
+
+        # A freshly triggered build sits in Jenkins' queue (not yet a
+        # numbered build) for a moment before it actually starts -- polling
+        # lastBuild during that window returns the *previous* build's
+        # already-terminal state, not the new one. Confirmed live: this
+        # raced hard enough to make the very first poll below see the old
+        # build's stale "ABORTED" and exit immediately, reporting failure
+        # while the real new build kept running in the background,
+        # unmonitored, for the next several minutes. Waiting here for
+        # lastBuild's number to actually advance past the pre-trigger
+        # baseline avoids that -- only then do we know we're looking at the
+        # new run, not the old one.
+        echo "waiting for the triggered build to leave the queue..."
+        TARGET_NUM=""
+        for i in $(seq 1 60); do
+          NUM=$(curl -s -u "$AUTH" "$JURL/job/build-service/lastBuild/api/json" 2>/dev/null | grep -o '"number":[0-9]*' | head -1 | cut -d: -f2)
+          if [ -n "$NUM" ] && [ "$NUM" -gt "$LAST_NUM" ]; then
+            TARGET_NUM="$NUM"
+            break
+          fi
+          sleep 2
+        done
+        if [ -z "$TARGET_NUM" ]; then
+          echo "build-service never left the queue after 2 minutes." >&2
+          exit 1
+        fi
+      fi
+
+      echo -n "waiting for build-service #$TARGET_NUM (all ${length(var.ecr_repository_names)} services, one at a time) to finish"
+      RESULT=""
+      # Up to 90 minutes -- 13 sequential kaniko builds on a resource-
+      # constrained Mac can genuinely take a while; polled every 5s so it
+      # returns promptly once actually done rather than over-waiting.
+      for i in $(seq 1 1080); do
+        JSON=$(curl -s -u "$AUTH" "$JURL/job/build-service/$TARGET_NUM/api/json" 2>/dev/null)
+        BUILDING=$(echo "$JSON" | grep -o '"building":[a-z]*' | head -1 | cut -d: -f2)
+        RESULT=$(echo "$JSON" | grep -o '"result":"[A-Z]*"' | head -1 | cut -d'"' -f4)
+        if [ "$BUILDING" = "false" ] && [ -n "$RESULT" ]; then
+          break
+        fi
+        sleep 5
+        echo -n "."
+      done
+      echo " $RESULT"
+
+      if [ "$RESULT" != "SUCCESS" ]; then
+        echo "build-service #$TARGET_NUM did not finish successfully (result='$RESULT')." >&2
+        exit 1
+      fi
+
+      echo "first-build seed complete -- all ${length(var.ecr_repository_names)} services built and pushed."
+    EOT
+  }
+}
+
+# Browser access to the Jenkins UI from this Mac -- a kubectl port-forward
+# instead of jenkins_ssh_tunnel's SSH tunnel (there's no VM to SSH into
+# anymore). Opt-in via jenkins_local_tunnel_port so a plain `terraform
+# apply` on a CI box never tries to spawn one.
+resource "terraform_data" "jenkins_tunnel" {
+  count = (var.manage_floci && var.jenkins_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.jenkins_install]
+
+  triggers_replace = {
+    local_port = var.jenkins_local_tunnel_port
+    # Re-run on every apply, not just when local_port changes: the actual
+    # kubectl port-forward process can die independently (killed by hand,
+    # laptop sleep, anything) with nothing here ever changing, silently
+    # leaving Jenkins unreachable until something forces a replace. Same
+    # self-healing-every-apply pattern as everything else in this file.
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/jenkins-tunnel-${var.jenkins_local_tunnel_port}.pid"
+
+      # Idempotency check: if the tunnel process is still alive AND the
+      # port still actually answers, leave it alone instead of killing and
+      # re-forwarding it every single apply for no reason -- confirmed
+      # live, this was happening unconditionally even when nothing was
+      # wrong, needlessly dropping the connection for a few seconds each
+      # time. Still self-healing: any real gap (process died, port stopped
+      # responding) falls through to the normal re-establish logic below.
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sf -o /dev/null "http://localhost:${var.jenkins_local_tunnel_port}/login"; then
+        echo "Jenkins tunnel already up and responding on localhost:${var.jenkins_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the jenkins Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints jenkins -n jenkins -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      # </dev/null is load-bearing, not cosmetic -- see jenkins_install's
+      # sibling resources in git history (jenkins_ssh_tunnel) for the full
+      # story: without it, this process's stdin stays connected to the pipe
+      # Terraform used to run this script, and the moment Terraform closes
+      # that pipe when the provisioner finishes, the backgrounded process
+      # gets an EOF/error on the still-open fd and dies -- fast enough that
+      # `echo $!` into the PIDFILE still succeeds and `terraform apply`
+      # still reports success, with nothing actually left listening.
+      nohup kubectl port-forward svc/jenkins -n jenkins ${var.jenkins_local_tunnel_port}:8080 \
+        </dev/null >/dev/null 2>&1 &
+      echo $! > "$PIDFILE"
+
+      echo "Jenkins UI: http://localhost:${var.jenkins_local_tunnel_port}"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/jenkins-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
+    EOT
+  }
+}
+
+# Browser access to the app itself -- same kubectl-port-forward pattern as
+# jenkins_tunnel. Depends on seed_first_build, not just argocd_manifests:
+# on a fresh cluster the web Service exists (from ArgoCD syncing this repo's
+# Application manifests) long before its pod has an image to actually run,
+# so waiting only on argocd_manifests just meant this tunnel came up
+# pointed at a Service with zero ready endpoints. Waiting on
+# seed_first_build instead means this resource only proceeds once ECR
+# actually has images (either seeded just now, or already present on a
+# non-fresh cluster, where seed_first_build no-ops near-instantly). Opt-in
+# via app_local_tunnel_port, same convention as the Jenkins tunnel.
+resource "terraform_data" "web_tunnel" {
+  count = (var.manage_floci && var.app_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.seed_first_build]
+
+  triggers_replace = {
+    local_port = var.app_local_tunnel_port
+    # Re-run on every apply -- see jenkins_tunnel's comment on the same
+    # field for why (the port-forward process can die independently of any
+    # Terraform-visible state).
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/web-tunnel-${var.app_local_tunnel_port}.pid"
+
+      # Idempotency check -- see jenkins_tunnel's comment on the same
+      # pattern for why.
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sf -o /dev/null "http://localhost:${var.app_local_tunnel_port}/login"; then
+        echo "Web tunnel already up and responding on localhost:${var.app_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the web Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints web -n ai-notification -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      # </dev/null is load-bearing -- see jenkins_tunnel's comment for why.
+      nohup kubectl port-forward svc/web -n ai-notification ${var.app_local_tunnel_port}:3000 \
+        </dev/null >/dev/null 2>&1 &
+      echo $! > "$PIDFILE"
+
+      echo "Web app: http://localhost:${var.app_local_tunnel_port}"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/web-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
+    EOT
+  }
+}
+
+# Browser access to the ArgoCD UI -- same pattern again. argocd-server serves
+# TLS only in this chart (no server.insecure toggle set in values-core.yaml),
+# so the forwarded port is 443 and the browser will show a self-signed-cert
+# warning -- expected, not a bug. Depends directly on argocd_install (not
+# argocd_manifests): the server Service exists as soon as ArgoCD itself is
+# up, independent of which Application manifests have been applied.
+resource "terraform_data" "argocd_tunnel" {
+  count = (var.manage_floci && var.argocd_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.argocd_install]
+
+  triggers_replace = {
+    local_port = var.argocd_local_tunnel_port
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/argocd-tunnel-${var.argocd_local_tunnel_port}.pid"
+
+      # Idempotency check -- see jenkins_tunnel's comment on the same
+      # pattern for why. -k: self-signed cert, same as the browser warning
+      # this tunnel already produces on purpose (see comment above).
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sfk -o /dev/null "https://localhost:${var.argocd_local_tunnel_port}"; then
+        echo "ArgoCD tunnel already up and responding on localhost:${var.argocd_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the argocd-server Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints argocd-server -n argocd -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      nohup kubectl port-forward svc/argocd-server -n argocd ${var.argocd_local_tunnel_port}:443 \
+        </dev/null >/dev/null 2>&1 &
+      echo $! > "$PIDFILE"
+
+      echo "ArgoCD UI: https://localhost:${var.argocd_local_tunnel_port} (admin / see 'argocd admin initial-password')"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/argocd-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
     EOT
   }
 }

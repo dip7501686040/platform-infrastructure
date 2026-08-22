@@ -18,16 +18,19 @@ enable_irsa_addons = true
 # Real AWS — nothing to emulate.
 manage_floci = false
 
-jenkins_mode          = "ec2"
-jenkins_instance_type = "t3.medium"
-# NOTE: placeholder — must be set to your actual IP/CIDR before applying to
-# real AWS. 0.0.0.0/0 exposes SSH/Jenkins UI to the entire internet.
-jenkins_admin_cidr = "0.0.0.0/0"
+# Jenkins runs as a Kubernetes workload — no jenkins_mode/instance_type/
+# admin_cidr needed anymore. Real-AWS browser/network exposure for it (an
+# Ingress + AWS Load Balancer Controller, most likely) is separate,
+# unbuilt, deferred prod work — see platform-infrastructure's own plan notes.
 
 # 0 (default) — disabled. Whoever needs browser access sets this to a real
 # port on *their own* machine; it should never be baked into a shared/CI
-# apply of the prod env.
+# apply of the prod env. Same reasoning for app/argocd — and both tunnels
+# are gated on manage_floci anyway (main.tf), so these are inert on prod
+# regardless.
 jenkins_local_tunnel_port = 0
+app_local_tunnel_port     = 0
+argocd_local_tunnel_port  = 0
 
 tags = {
   Project     = "ai-notification-system"

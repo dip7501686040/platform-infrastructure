@@ -25,17 +25,20 @@ node_max_size       = 1
 # cert lookup) can't be validated locally — keep addons off for this pass.
 enable_irsa_addons = false
 
-# Path A/B test in progress (see plan §0) — "ec2" until proven otherwise
-# against Floci's EC2 emulation; switch to "docker" if nested Docker
-# inside Floci's EC2-emulation container doesn't work.
-jenkins_mode          = "ec2"
-jenkins_instance_type = "t3.medium"
-# Disposable local-only pass — open is fine here, never for the AWS env.
-jenkins_admin_cidr = "0.0.0.0/0"
+# Jenkins runs as a Kubernetes workload (see terraform_data.jenkins_install
+# in main.tf), not a dedicated EC2 instance — no jenkins_mode/instance_type/
+# admin_cidr needed anymore.
 
-# Browser access via a Terraform-managed SSH tunnel — see jenkins_ssh_tunnel
-# in main.tf. http://localhost:8091 once applied.
+# Browser access via a Terraform-managed kubectl port-forward — see
+# jenkins_tunnel in main.tf. http://localhost:8091 once applied.
 jenkins_local_tunnel_port = 8091
+
+# Same pattern for the app itself (web_tunnel) and the ArgoCD UI
+# (argocd_tunnel) — http://localhost:3000 and https://localhost:8090 once
+# applied (app_local_tunnel_port stays 3000 to match the app's own port so
+# nothing surprising shows up in the browser bar).
+app_local_tunnel_port    = 3000
+argocd_local_tunnel_port = 8090
 
 tags = {
   Project     = "ai-notification-system"

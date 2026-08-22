@@ -51,12 +51,22 @@ def sourceRepoScm = new GitSCM(
   null, null, []
 )
 
-// Generic/manual-override job — SERVICES accepts a comma-separated list
-// or "all", nothing pinned.
+// Generic/manual-override job — SERVICES accepts a comma-separated list or
+// "all", nothing pinned. Explicit params here (not null/left to the
+// Jenkinsfile's own declarative parameters{} block to register itself) —
+// that block only becomes an actual job property *after* a first build
+// runs (same gotcha watchJob.scheduleBuild2(0) below works around for
+// triggers{}), so without this, any automated first-ever
+// buildWithParameters call (e.g. Terraform's seed_first_build) 400s with
+// "build-service is not parameterized".
 createOrUpdateJob(
   "build-service",
   "CI: build/push any service(s) and bump image tags in git. Generic/manual-override job — for a pre-ready single-click build of one specific service, use the build-<service> jobs instead.",
-  null
+  new ParametersDefinitionProperty([
+    new ChoiceParameterDefinition("ENVIRONMENT", ["local", "prod"] as String[], "Which k8s/environments/<env> to update"),
+    new StringParameterDefinition("SERVICES", "identity-service", "Comma-separated service names, or \"all\""),
+    new StringParameterDefinition("WEB_API_URL", "", "Overrides web's NEXT_PUBLIC_API_URL build-arg"),
+  ])
 )
 
 // One pre-ready, one-click job per service — same Jenkinsfile/repo/branch,
