@@ -1,0 +1,73 @@
+name: infra-apply
+
+# Deliberately does NOT use actions/checkout. secrets.local.tfvars and
+# envs/state/ (the Terraform state file) are both gitignored -- a fresh
+# checkout into a new _work/ directory would have neither, and Terraform
+# would either fail (no secrets) or, worse, "succeed" by planning a full
+# resource recreation against empty state. Instead this operates directly
+# on the fixed-path working copy that's already checked out on this Mac
+# (the same one used interactively all along), pulling the latest commit
+# into it first. See the repo's own plan notes for why.
+env:
+  WORKDIR: /Users/dipankarsaha/platform-infrastructure
+
+on:
+  # Deliberate infra *changes*: push a .tf edit, then click this manually.
+  # Never automatic on push -- after the "would have destroyed 60
+  # resources" scare during initial setup, infra applies get a deliberate
+  # human click, not a silent auto-apply.
+  workflow_dispatch: {}
+
+jobs:
+  apply:
+    runs-on: self-hosted
+    timeout-minutes: 90
+    steps:
+      - name: Start Docker Desktop and wait for it
+        run: |
+          set -e
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker not responding -- starting Docker Desktop..."
+            open -a Docker
+          fi
+          echo "waiting for Docker to be ready..."
+          for i in $(seq 1 60); do
+            docker info >/dev/null 2>&1 && { echo "Docker is up."; exit 0; }
+            sleep 5
+          done
+          echo "Docker never became ready after 5 minutes." >&2
+          exit 1
+
+      - name: Sync working copy to latest main
+        run: |
+          set -e
+          cd "$WORKDIR"
+          # Stash, not discard: this directory doubles as an interactive
+          # dev checkout, and a blind `reset --hard` would silently destroy
+          # any uncommitted work-in-progress sitting in it when this runs
+          # (including from an unattended reboot-recovery trigger, with no
+          # one watching). Stashing keeps it recoverable via `git stash
+          # list` instead.
+          if [ -n "$(git status --porcelain)" ]; then
+            git stash push -u -m "infra-apply workflow: auto-stashed $(date -u +%FT%TZ)"
+          fi
+          git fetch origin main
+          git checkout main
+          git reset --hard origin/main
+
+      - name: Terraform init
+        run: |
+          set -e
+          cd "$WORKDIR"
+          source local/floci-env.sh
+          terraform init -backend-config=envs/local.backend.hcl -reconfigure
+
+      - name: Terraform apply
+        run: |
+          set -e
+          cd "$WORKDIR"
+          source local/floci-env.sh
+          terraform apply \
+            -var-file=envs/local.tfvars \
+            -var-file=secrets.local.tfvars \
+            -auto-approve
