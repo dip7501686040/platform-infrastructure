@@ -40,6 +40,11 @@ jenkins_local_tunnel_port = 8091
 # extra_ports).
 argocd_local_tunnel_port = 8090
 
+# Observability platform (main.tf) -- Grafana/Prometheus/Jaeger UIs.
+grafana_local_tunnel_port    = 8092
+prometheus_local_tunnel_port = 8093
+jaeger_local_tunnel_port     = 8094
+
 tags = {
   Project     = "ai-notification-system"
   Environment = "local"

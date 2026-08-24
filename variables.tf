@@ -106,6 +106,24 @@ variable "argocd_local_tunnel_port" {
   default     = 0
 }
 
+variable "grafana_local_tunnel_port" {
+  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Grafana Service's port 80. 0 disables it (default)."
+  type        = number
+  default     = 0
+}
+
+variable "prometheus_local_tunnel_port" {
+  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Prometheus server Service's port 80. 0 disables it (default)."
+  type        = number
+  default     = 0
+}
+
+variable "jaeger_local_tunnel_port" {
+  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Jaeger query UI's port 16686. 0 disables it (default)."
+  type        = number
+  default     = 0
+}
+
 variable "lb_services" {
   description = <<-EOT
     Public-facing services fronted by the ALB (modules/loadbalancer).

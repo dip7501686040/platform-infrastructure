@@ -45,3 +45,19 @@ output "api_gateway_url" {
 output "argocd_url" {
   value = var.argocd_local_tunnel_port > 0 ? "https://localhost:${var.argocd_local_tunnel_port}" : null
 }
+
+output "grafana_url" {
+  value = var.grafana_local_tunnel_port > 0 ? "http://localhost:${var.grafana_local_tunnel_port}" : null
+}
+
+output "grafana_admin_password_path" {
+  value = local_sensitive_file.grafana_admin_password.filename
+}
+
+output "prometheus_url" {
+  value = var.prometheus_local_tunnel_port > 0 ? "http://localhost:${var.prometheus_local_tunnel_port}" : null
+}
+
+output "jaeger_url" {
+  value = var.jaeger_local_tunnel_port > 0 ? "http://localhost:${var.jaeger_local_tunnel_port}" : null
+}

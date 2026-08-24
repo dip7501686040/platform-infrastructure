@@ -859,3 +859,681 @@ os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/argocd-server', '-n', 'ar
     EOT
   }
 }
+
+# ---------------------------------------------------------------------------
+# Observability platform -- Terraform-installed, like ArgoCD/Jenkins above
+# (platform/CI control plane, not an application). Diagnostic tooling only:
+# no HPA/ScaledObject/scaling policy lives here (those are GitOps-managed,
+# app-level, and only get turned on once a load test actually names a real
+# bottleneck -- see the load-test plan). metrics-server + KEDA's operator are
+# the exception -- inert until something references them (an HPA or
+# ScaledObject), safe to stand up now alongside the rest.
+#
+# Deliberately excluded to keep this machine's load down: Loki, Jaeger's
+# full multi-component Helm chart (Cassandra/ES by default -- a plain
+# Deployment+Service for the all-in-one image instead), Alertmanager,
+# node-exporter, the Prometheus Operator/CRDs. Annotation-based Prometheus
+# scraping (prometheus.io/scrape, built into the community chart's default
+# scrape_configs) instead of ServiceMonitors -- no extra CRDs needed.
+# ---------------------------------------------------------------------------
+
+resource "terraform_data" "observability_namespace" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.argocd_tunnel]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+      # --validate=false: confirmed live, kubeconfig.sh's own readiness wait
+      # (a plain `kubectl get nodes`) can succeed before the API server's
+      # OpenAPI schema endpoint is ready, which is what client-side
+      # validation needs to fetch -- "failed to download openapi: the
+      # server could not find the requested resource". Not needed for a
+      # plain Namespace object anyway.
+      kubectl create namespace observability --dry-run=client -o yaml | kubectl apply --validate=false -f - >/dev/null
+    EOT
+  }
+}
+
+# k3s sometimes ships metrics-server as a built-in addon already -- checked
+# first so this doesn't fight or duplicate it.
+resource "terraform_data" "metrics_server_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.observability_namespace]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      # Check the ServiceAccount, with a short retry loop -- not the
+      # Deployment, and not a one-shot check. Confirmed live: k3s ships its
+      # own built-in metrics-server via its own addon mechanism
+      # (k3s.cattle.io/v1 Kind=Addon, not Helm-owned) that keeps flapping the
+      # Deployment/pod (real liveness-probe timeouts, likely resource
+      # contention from everything else running on this machine) -- a
+      # Deployment-existence check can race a moment mid-recreate and see
+      # nothing, sending this into a `helm upgrade --install` that then
+      # fails hard on the ServiceAccount's k3s ownership metadata ("cannot
+      # be imported into the current release"). The ServiceAccount itself
+      # stayed stable the whole time this was being debugged, unlike the
+      # Deployment -- checked here instead, with retries to survive a
+      # genuinely-in-flight reconcile rather than assuming one bad instant
+      # means "nothing here yet".
+      FOUND=false
+      for i in $(seq 1 15); do
+        if kubectl get serviceaccount metrics-server -n kube-system >/dev/null 2>&1; then
+          FOUND=true
+          break
+        fi
+        sleep 2
+      done
+
+      if [ "$FOUND" = "true" ]; then
+        echo "metrics-server already present (k3s built-in or a prior apply) -- waiting for it to be ready instead of installing a competing Helm release..."
+        kubectl rollout status deployment/metrics-server -n kube-system --timeout=120s || true
+        exit 0
+      fi
+
+      helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ >/dev/null 2>&1 || true
+      helm repo update metrics-server >/dev/null 2>&1
+
+      # --kubelet-insecure-tls: k3s's kubelet certs are self-signed, same
+      # reasoning as kubeconfig.sh's own insecure-skip-tls-verify.
+      helm upgrade --install metrics-server metrics-server/metrics-server \
+        --namespace kube-system \
+        --set args="{--kubelet-insecure-tls}" \
+        --wait --timeout 5m
+    EOT
+  }
+}
+
+resource "terraform_data" "kube_state_metrics_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.metrics_server_install]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      READY=$(kubectl get deployment kube-state-metrics -n observability -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$${READY:-0}" -ge 1 ]; then
+        echo "kube-state-metrics already deployed and healthy -- skipping."
+        exit 0
+      fi
+
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
+      helm repo update prometheus-community >/dev/null 2>&1
+
+      # Service annotations, not a ServiceMonitor -- picked up automatically
+      # by the Prometheus chart's default kubernetes-service-endpoints scrape
+      # job below, no CRDs involved. --set-string, not --set: annotations
+      # must be strings, but --set's own type inference parses `true`/`8080`
+      # as bool/number, which Kubernetes then rejects decoding
+      # metadata.annotations (must be map[string]string).
+      helm upgrade --install kube-state-metrics prometheus-community/kube-state-metrics \
+        --namespace observability \
+        --set-string service.annotations."prometheus\.io/scrape"=true \
+        --set-string service.annotations."prometheus\.io/port"=8080 \
+        --wait --timeout 5m
+    EOT
+  }
+}
+
+# Plain Deployment+Service, not the official jaeger Helm chart (which pulls
+# in Cassandra/Elasticsearch sub-charts by default) -- all-in-one's native
+# OTLP receiver (COLLECTOR_OTLP_ENABLED) is all otel-collector's traces
+# pipeline needs to talk to, in-memory storage is fine for a demo window.
+resource "terraform_data" "jaeger_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.kube_state_metrics_install]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      cat <<'YAML' | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: observability
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: jaeger }
+  template:
+    metadata:
+      labels: { app: jaeger }
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.60
+          env:
+            - name: COLLECTOR_OTLP_ENABLED
+              value: "true"
+          ports:
+            - containerPort: 4317
+            - containerPort: 4318
+            - containerPort: 16686
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { cpu: 250m, memory: 256Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: observability
+spec:
+  selector: { app: jaeger }
+  ports:
+    - name: otlp-grpc
+      port: 4317
+      targetPort: 4317
+    - name: otlp-http
+      port: 4318
+      targetPort: 4318
+    - name: query
+      port: 16686
+      targetPort: 16686
+YAML
+
+      kubectl rollout status deployment/jaeger -n observability --timeout=120s
+    EOT
+  }
+}
+
+# Renders the otel-collector chart's values -- same pipeline shape as
+# infra/otel/otel-collector-config.yaml (this repo's docker-compose stack),
+# minus the loki exporter/pipeline (logs stay out of scope here), plus the
+# k8s-specific bits (ports.prometheus + service annotations) that config
+# doesn't need since docker-compose's Prometheus scrapes it by container
+# name, not k8s service discovery.
+resource "local_file" "otel_collector_values" {
+  content  = <<-EOT
+    mode: deployment
+
+    # Newer chart versions dropped their own default -- must be set
+    # explicitly now. Core distribution, not contrib: only otlp
+    # receivers/batch processor/otlp+prometheus exporters are used here,
+    # all included in core.
+    image:
+      repository: otel/opentelemetry-collector
+
+    config:
+      receivers:
+        otlp:
+          protocols:
+            grpc:
+              endpoint: 0.0.0.0:4317
+            http:
+              endpoint: 0.0.0.0:4318
+      processors:
+        batch: {}
+      exporters:
+        otlp/jaeger:
+          endpoint: jaeger.observability.svc.cluster.local:4317
+          tls:
+            insecure: true
+        prometheus:
+          endpoint: 0.0.0.0:8889
+      service:
+        telemetry:
+          logs:
+            level: info
+        pipelines:
+          traces:
+            receivers: [otlp]
+            processors: [batch]
+            exporters: [otlp/jaeger]
+          metrics:
+            receivers: [otlp]
+            processors: [batch]
+            exporters: [prometheus]
+
+    ports:
+      prometheus:
+        enabled: true
+        containerPort: 8889
+        servicePort: 8889
+        protocol: TCP
+
+    service:
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8889"
+
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 250m, memory: 256Mi }
+  EOT
+  filename = "${path.root}/envs/state/otel-collector-values.yaml"
+}
+
+resource "terraform_data" "otel_collector_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.jaeger_install, local_file.otel_collector_values]
+
+  triggers_replace = {
+    always_run  = timestamp()
+    values_hash = local_file.otel_collector_values.content_sha256
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      DEPLOYED_HASH=$(kubectl get deployment otel-collector-opentelemetry-collector -n observability -o jsonpath='{.metadata.annotations.values-hash}' 2>/dev/null || true)
+      READY=$(kubectl get deployment otel-collector-opentelemetry-collector -n observability -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$DEPLOYED_HASH" = "${local_file.otel_collector_values.content_sha256}" ] && [ "$${READY:-0}" -ge 1 ]; then
+        echo "otel-collector already deployed and healthy with unchanged config -- skipping."
+        exit 0
+      fi
+
+      helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts >/dev/null 2>&1 || true
+      helm repo update open-telemetry >/dev/null 2>&1
+
+      helm upgrade --install otel-collector open-telemetry/opentelemetry-collector \
+        --namespace observability \
+        -f "${local_file.otel_collector_values.filename}" \
+        --wait --timeout 5m
+
+      kubectl annotate deployment otel-collector-opentelemetry-collector -n observability \
+        values-hash="${local_file.otel_collector_values.content_sha256}" --overwrite
+    EOT
+  }
+}
+
+resource "terraform_data" "prometheus_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.otel_collector_install]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      READY=$(kubectl get deployment prometheus-server -n observability -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$${READY:-0}" -ge 1 ]; then
+        echo "Prometheus already deployed and healthy -- skipping (upgrade instead if values changed -- see argocd_install's comment on why this skip pattern is safe for a config that rarely changes)."
+        exit 0
+      fi
+
+      helm repo add prometheus-community https://prometheus-community.github.io/helm-charts >/dev/null 2>&1 || true
+      helm repo update prometheus-community >/dev/null 2>&1
+
+      # kube-state-metrics.enabled=false: deployed separately above, avoid a
+      # duplicate. alertmanager/node-exporter disabled -- not needed for
+      # this goal, keeps footprint down. The chart's own default
+      # scrape_configs already includes kubernetes-pods (annotation-based,
+      # picks up api-gateway's future /metrics) and
+      # kubernetes-nodes-cadvisor (per-pod CPU/memory via the kubelet, no
+      # separate cAdvisor container needed in k8s) -- nothing custom needed
+      # here for either.
+      helm upgrade --install prometheus prometheus-community/prometheus \
+        --namespace observability \
+        --set server.retention=6h \
+        --set server.resources.requests.cpu=100m \
+        --set server.resources.requests.memory=256Mi \
+        --set server.resources.limits.cpu=500m \
+        --set server.resources.limits.memory=512Mi \
+        --set alertmanager.enabled=false \
+        --set prometheus-node-exporter.enabled=false \
+        --set kube-state-metrics.enabled=false \
+        --set prometheus-pushgateway.enabled=false \
+        --wait --timeout 5m
+    EOT
+  }
+}
+
+resource "random_password" "grafana_admin" {
+  length  = 24
+  special = false
+}
+
+resource "local_sensitive_file" "grafana_admin_password" {
+  content         = random_password.grafana_admin.result
+  filename        = "${path.root}/envs/state/grafana-admin-password.txt"
+  file_permission = "0600"
+}
+
+resource "local_file" "grafana_values" {
+  content = <<-EOT
+    adminUser: admin
+    adminPassword: "${random_password.grafana_admin.result}"
+
+    persistence:
+      enabled: false
+
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { cpu: 250m, memory: 256Mi }
+
+    datasources:
+      datasources.yaml:
+        apiVersion: 1
+        datasources:
+          - name: Prometheus
+            type: prometheus
+            url: http://prometheus-server.observability.svc.cluster.local
+            access: proxy
+            isDefault: true
+          - name: Jaeger
+            type: jaeger
+            url: http://jaeger.observability.svc.cluster.local:16686
+            access: proxy
+  EOT
+  filename = "${path.root}/envs/state/grafana-values.yaml"
+}
+
+resource "terraform_data" "grafana_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.prometheus_install, local_file.grafana_values]
+
+  triggers_replace = {
+    always_run  = timestamp()
+    values_hash = local_file.grafana_values.content_sha256
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      DEPLOYED_HASH=$(kubectl get deployment grafana -n observability -o jsonpath='{.metadata.annotations.values-hash}' 2>/dev/null || true)
+      READY=$(kubectl get deployment grafana -n observability -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$DEPLOYED_HASH" = "${local_file.grafana_values.content_sha256}" ] && [ "$${READY:-0}" -ge 1 ]; then
+        echo "Grafana already deployed and healthy with unchanged config -- skipping."
+        exit 0
+      fi
+
+      helm repo add grafana https://grafana.github.io/helm-charts >/dev/null 2>&1 || true
+      helm repo update grafana >/dev/null 2>&1
+
+      helm upgrade --install grafana grafana/grafana \
+        --namespace observability \
+        -f "${local_file.grafana_values.filename}" \
+        --wait --timeout 5m
+
+      kubectl annotate deployment grafana -n observability \
+        values-hash="${local_file.grafana_values.content_sha256}" --overwrite
+    EOT
+  }
+}
+
+# Browser access to Grafana -- same kubectl-port-forward pattern as
+# jenkins_tunnel/argocd_tunnel (see jenkins_tunnel's comments for the full
+# daemonize/RUNNER_TRACKING_ID story, not repeated here).
+resource "terraform_data" "grafana_tunnel" {
+  count = (var.manage_floci && var.grafana_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.grafana_install]
+
+  triggers_replace = {
+    local_port = var.grafana_local_tunnel_port
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/grafana-tunnel-${var.grafana_local_tunnel_port}.pid"
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sf -o /dev/null "http://localhost:${var.grafana_local_tunnel_port}/login"; then
+        echo "Grafana tunnel already up and responding on localhost:${var.grafana_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the grafana Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints grafana -n observability -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      python3 -c "
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/grafana', '-n', 'observability', '${var.grafana_local_tunnel_port}:80'], env)
+" </dev/null >/dev/null 2>&1
+
+      echo "Grafana UI: http://localhost:${var.grafana_local_tunnel_port} (admin / see envs/state/grafana-admin-password.txt)"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/grafana-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
+    EOT
+  }
+}
+
+# Browser access to Prometheus's own UI -- for ad-hoc PromQL queries/target
+# debugging, separate from Grafana's dashboards.
+resource "terraform_data" "prometheus_tunnel" {
+  count = (var.manage_floci && var.prometheus_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.prometheus_install]
+
+  triggers_replace = {
+    local_port = var.prometheus_local_tunnel_port
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/prometheus-tunnel-${var.prometheus_local_tunnel_port}.pid"
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sf -o /dev/null "http://localhost:${var.prometheus_local_tunnel_port}/-/healthy"; then
+        echo "Prometheus tunnel already up and responding on localhost:${var.prometheus_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the prometheus-server Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints prometheus-server -n observability -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      python3 -c "
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/prometheus-server', '-n', 'observability', '${var.prometheus_local_tunnel_port}:80'], env)
+" </dev/null >/dev/null 2>&1
+
+      echo "Prometheus UI: http://localhost:${var.prometheus_local_tunnel_port}"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/prometheus-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
+    EOT
+  }
+}
+
+# Browser access to Jaeger's own trace-search UI.
+resource "terraform_data" "jaeger_tunnel" {
+  count = (var.manage_floci && var.jaeger_local_tunnel_port > 0) ? 1 : 0
+
+  depends_on = [terraform_data.jaeger_install]
+
+  triggers_replace = {
+    local_port = var.jaeger_local_tunnel_port
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      PIDFILE="${path.root}/envs/state/jaeger-tunnel-${var.jaeger_local_tunnel_port}.pid"
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
+         curl -sf -o /dev/null "http://localhost:${var.jaeger_local_tunnel_port}"; then
+        echo "Jaeger tunnel already up and responding on localhost:${var.jaeger_local_tunnel_port} -- leaving it alone."
+        exit 0
+      fi
+
+      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        sleep 1
+      fi
+
+      echo "waiting for the jaeger Service to have a ready endpoint..."
+      for i in $(seq 1 60); do
+        EP=$(kubectl get endpoints jaeger -n observability -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
+        [ -n "$EP" ] && break
+        sleep 2
+      done
+
+      python3 -c "
+import os, sys
+if os.fork() > 0:
+    sys.exit(0)
+os.setsid()
+if os.fork() > 0:
+    sys.exit(0)
+with open('$PIDFILE', 'w') as f:
+    f.write(str(os.getpid()))
+env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
+os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/jaeger', '-n', 'observability', '${var.jaeger_local_tunnel_port}:16686'], env)
+" </dev/null >/dev/null 2>&1
+
+      echo "Jaeger UI: http://localhost:${var.jaeger_local_tunnel_port}"
+    EOT
+  }
+
+  provisioner "local-exec" {
+    when        = destroy
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      PIDFILE="${path.root}/envs/state/jaeger-tunnel-${self.triggers_replace.local_port}.pid"
+      if [ -f "$PIDFILE" ]; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null || true
+        rm -f "$PIDFILE"
+      fi
+    EOT
+  }
+}
+
+# KEDA operator only -- inert until a ScaledObject exists (see the load-test
+# plan's Phase F). Its own CRDs (ScaledObject, TriggerAuthentication) +
+# metrics adapter come with it.
+resource "terraform_data" "keda_install" {
+  count = var.manage_floci ? 1 : 0
+
+  depends_on = [terraform_data.grafana_install]
+
+  triggers_replace = {
+    always_run = timestamp()
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
+
+      READY=$(kubectl get deployment keda-operator -n keda -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
+      if [ "$${READY:-0}" -ge 1 ]; then
+        echo "KEDA already installed and healthy -- skipping."
+        exit 0
+      fi
+
+      helm repo add kedacore https://kedacore.github.io/charts >/dev/null 2>&1 || true
+      helm repo update kedacore >/dev/null 2>&1
+
+      helm upgrade --install keda kedacore/keda \
+        --namespace keda --create-namespace \
+        --wait --timeout 5m
+    EOT
+  }
+}
