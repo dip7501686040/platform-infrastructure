@@ -84,16 +84,53 @@ variable "jenkins_local_tunnel_port" {
   default     = 0
 }
 
-variable "app_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the web app Service's port 3000. 0 disables it (default) — leave disabled on any box that isn't a human's dev machine."
+# Floci only -- real AWS reaches the ALB at its actual DNS name, no local
+# port publishing involved. web/api-gateway are reached exclusively through
+# the ALB now (no kubectl-port-forward tunnel anymore -- see git history for
+# the removed web_tunnel resource).
+variable "alb_web_local_port" {
+  description = "Local Mac port the ALB's web listener (inside the floci container's own netns) is published on."
   type        = number
-  default     = 0
+  default     = 8080
+}
+
+variable "alb_api_gateway_local_port" {
+  description = "Local Mac port the ALB's api-gateway listener is published on. Defaults to 8000 to match NEXT_PUBLIC_API_URL's own default -- no web-side config change needed."
+  type        = number
+  default     = 8000
 }
 
 variable "argocd_local_tunnel_port" {
   description = "Local Mac port for a Terraform-managed kubectl port-forward to the ArgoCD server Service's port 443 (TLS, self-signed — expect a browser warning). 0 disables it (default) — leave disabled on any box that isn't a human's dev machine."
   type        = number
   default     = 0
+}
+
+variable "lb_services" {
+  description = <<-EOT
+    Public-facing services fronted by the ALB (modules/loadbalancer).
+    node_port must match the fixed NodePort set on that service's k8s
+    Service (platform-gitops k8s/environments/<env>/values-<service>.yaml)
+    -- both environments use the same node_port values, so this default
+    doesn't need to differ per env.
+  EOT
+  type = map(object({
+    listener_port     = number
+    node_port         = number
+    health_check_path = string
+  }))
+  default = {
+    web = {
+      listener_port     = 80
+      node_port         = 30080
+      health_check_path = "/login"
+    }
+    api-gateway = {
+      listener_port     = 8000
+      node_port         = 30081
+      health_check_path = "/health"
+    }
+  }
 }
 
 variable "ecr_repository_names" {

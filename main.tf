@@ -5,6 +5,17 @@
 module "floci" {
   count  = var.manage_floci ? 1 : 0
   source = "./modules/floci"
+
+  # The ALB's listener ports (modules/loadbalancer) live inside this
+  # container's own network namespace -- host-published here so
+  # web/api-gateway are actually browser-reachable, the same way a real
+  # ALB's DNS name is reachable in prod. Referencing var.lb_services rather
+  # than hardcoding 80/8000 a second time keeps one source of truth for
+  # which internal ports need publishing.
+  extra_ports = {
+    "${var.lb_services["web"].listener_port}"         = var.alb_web_local_port
+    "${var.lb_services["api-gateway"].listener_port}" = var.alb_api_gateway_local_port
+  }
 }
 
 module "network" {
@@ -51,6 +62,26 @@ module "addons" {
   oidc_provider_arn  = module.eks.oidc_provider_arn
   oidc_provider_url  = module.eks.oidc_provider_url
   tags               = var.tags
+}
+
+# Fronts web + api-gateway with a real ALB via Floci's ELBv2 emulation
+# locally and a real AWS ALB in prod -- same module, same resource blocks;
+# only target registration differs (see modules/loadbalancer's own
+# comments). depends_on module.eks directly (not just module.floci): needs
+# the node group + cluster security group to exist first.
+module "loadbalancer" {
+  source     = "./modules/loadbalancer"
+  depends_on = [module.floci, module.eks]
+
+  manage_floci              = var.manage_floci
+  name_prefix               = var.cluster_name
+  vpc_id                     = module.network.vpc_id
+  public_subnet_ids          = module.network.public_subnet_ids
+  cluster_security_group_id  = module.eks.cluster_security_group_id
+  node_group_asg_name        = module.eks.node_group_asg_name
+  floci_eks_container_name   = "floci-eks-${var.cluster_name}"
+  services                   = var.lb_services
+  tags                       = var.tags
 }
 
 # Makes the previously-manual "docker update --restart=unless-stopped on
@@ -740,93 +771,6 @@ os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/jenkins', '-n', 'jenkins'
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       PIDFILE="${path.root}/envs/state/jenkins-tunnel-${self.triggers_replace.local_port}.pid"
-      if [ -f "$PIDFILE" ]; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        rm -f "$PIDFILE"
-      fi
-    EOT
-  }
-}
-
-# Browser access to the app itself -- same kubectl-port-forward pattern as
-# jenkins_tunnel. Depends on seed_first_build, not just argocd_manifests:
-# on a fresh cluster the web Service exists (from ArgoCD syncing this repo's
-# Application manifests) long before its pod has an image to actually run,
-# so waiting only on argocd_manifests just meant this tunnel came up
-# pointed at a Service with zero ready endpoints. Waiting on
-# seed_first_build instead means this resource only proceeds once ECR
-# actually has images (either seeded just now, or already present on a
-# non-fresh cluster, where seed_first_build no-ops near-instantly). Opt-in
-# via app_local_tunnel_port, same convention as the Jenkins tunnel.
-resource "terraform_data" "web_tunnel" {
-  count = (var.manage_floci && var.app_local_tunnel_port > 0) ? 1 : 0
-
-  depends_on = [terraform_data.seed_first_build]
-
-  triggers_replace = {
-    local_port = var.app_local_tunnel_port
-    # Re-run on every apply -- see jenkins_tunnel's comment on the same
-    # field for why (the port-forward process can die independently of any
-    # Terraform-visible state).
-    always_run = timestamp()
-  }
-
-  provisioner "local-exec" {
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
-
-      PIDFILE="${path.root}/envs/state/web-tunnel-${var.app_local_tunnel_port}.pid"
-
-      # Idempotency check -- see jenkins_tunnel's comment on the same
-      # pattern for why.
-      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && \
-         curl -sf -o /dev/null "http://localhost:${var.app_local_tunnel_port}/login"; then
-        echo "Web tunnel already up and responding on localhost:${var.app_local_tunnel_port} -- leaving it alone."
-        exit 0
-      fi
-
-      if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
-        kill "$(cat "$PIDFILE")" 2>/dev/null || true
-        sleep 1
-      fi
-
-      echo "waiting for the web Service to have a ready endpoint..."
-      for i in $(seq 1 60); do
-        EP=$(kubectl get endpoints web -n ai-notification -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)
-        [ -n "$EP" ] && break
-        sleep 2
-      done
-
-      # Double-fork daemonize + a filtered exec environment -- see
-      # jenkins_tunnel's comment for the full story on why (short version:
-      # the GitHub Actions runner kills orphaned processes by scanning for
-      # a RUNNER_TRACKING_ID env var, not by process tree/group, so that
-      # var has to be stripped before the final exec, not just detached
-      # from the process tree).
-      python3 -c "
-import os, sys
-if os.fork() > 0:
-    sys.exit(0)
-os.setsid()
-if os.fork() > 0:
-    sys.exit(0)
-with open('$PIDFILE', 'w') as f:
-    f.write(str(os.getpid()))
-env = {k: v for k, v in os.environ.items() if not k.startswith(('RUNNER_', 'GITHUB_', 'ACTIONS_'))}
-os.execvpe('kubectl', ['kubectl', 'port-forward', 'svc/web', '-n', 'ai-notification', '${var.app_local_tunnel_port}:3000'], env)
-" </dev/null >/dev/null 2>&1
-
-      echo "Web app: http://localhost:${var.app_local_tunnel_port}"
-    EOT
-  }
-
-  provisioner "local-exec" {
-    when        = destroy
-    interpreter = ["/bin/bash", "-c"]
-    command     = <<-EOT
-      PIDFILE="${path.root}/envs/state/web-tunnel-${self.triggers_replace.local_port}.pid"
       if [ -f "$PIDFILE" ]; then
         kill "$(cat "$PIDFILE")" 2>/dev/null || true
         rm -f "$PIDFILE"

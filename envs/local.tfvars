@@ -33,11 +33,11 @@ enable_irsa_addons = false
 # jenkins_tunnel in main.tf. http://localhost:8091 once applied.
 jenkins_local_tunnel_port = 8091
 
-# Same pattern for the app itself (web_tunnel) and the ArgoCD UI
-# (argocd_tunnel) — http://localhost:3000 and https://localhost:8090 once
-# applied (app_local_tunnel_port stays 3000 to match the app's own port so
-# nothing surprising shows up in the browser bar).
-app_local_tunnel_port    = 3000
+# Same pattern for the ArgoCD UI (argocd_tunnel) — https://localhost:8090
+# once applied. web/api-gateway aren't tunneled anymore -- they're reached
+# through the ALB instead (alb_web_local_port/alb_api_gateway_local_port,
+# defaults 8080/8000 -- see modules/loadbalancer and modules/floci's
+# extra_ports).
 argocd_local_tunnel_port = 8090
 
 tags = {

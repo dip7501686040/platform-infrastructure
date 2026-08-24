@@ -25,11 +25,11 @@ manage_floci = false
 
 # 0 (default) — disabled. Whoever needs browser access sets this to a real
 # port on *their own* machine; it should never be baked into a shared/CI
-# apply of the prod env. Same reasoning for app/argocd — and both tunnels
-# are gated on manage_floci anyway (main.tf), so these are inert on prod
-# regardless.
+# apply of the prod env. Same reasoning for argocd — and both tunnels are
+# gated on manage_floci anyway (main.tf), so these are inert on prod
+# regardless. web/api-gateway need no local port at all here -- prod reaches
+# them at the ALB's real DNS name (outputs.web_url/api_gateway_url).
 jenkins_local_tunnel_port = 0
-app_local_tunnel_port     = 0
 argocd_local_tunnel_port  = 0
 
 tags = {

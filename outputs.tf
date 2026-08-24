@@ -35,7 +35,11 @@ output "jenkins_url" {
 }
 
 output "web_url" {
-  value = var.app_local_tunnel_port > 0 ? "http://localhost:${var.app_local_tunnel_port}" : null
+  value = var.manage_floci ? "http://localhost:${var.alb_web_local_port}" : module.loadbalancer.dns_name
+}
+
+output "api_gateway_url" {
+  value = var.manage_floci ? "http://localhost:${var.alb_api_gateway_local_port}" : module.loadbalancer.dns_name
 }
 
 output "argocd_url" {

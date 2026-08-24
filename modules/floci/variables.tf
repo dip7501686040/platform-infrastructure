@@ -14,3 +14,15 @@ variable "port" {
   type        = number
   default     = 4566
 }
+
+variable "extra_ports" {
+  description = <<-EOT
+    Additional container_port -> host_port mappings to publish on this
+    container -- e.g. the ALB's listener ports (see modules/loadbalancer),
+    which live inside this container's own network namespace and aren't
+    host-reachable otherwise. Keyed by container port as a string (map keys
+    must be strings), valued by the host port to publish it on.
+  EOT
+  type        = map(number)
+  default     = {}
+}

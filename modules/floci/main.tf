@@ -19,6 +19,14 @@ resource "docker_container" "floci" {
     external = var.port
   }
 
+  dynamic "ports" {
+    for_each = var.extra_ports
+    content {
+      internal = tonumber(ports.key)
+      external = ports.value
+    }
+  }
+
   # Without this, FLOCI_STORAGE_MODE defaults to "memory" — every AWS
   # resource Floci has ever emulated (VPC, ECR repos, the EKS cluster, the
   # EC2/Jenkins instance) is forgotten the instant this container restarts,
