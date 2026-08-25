@@ -948,7 +948,33 @@ resource "terraform_data" "observability_namespace" {
       # validation needs to fetch -- "failed to download openapi: the
       # server could not find the requested resource". Not needed for a
       # plain Namespace object anyway.
-      kubectl create namespace observability --dry-run=client -o yaml | kubectl apply --validate=false -f - >/dev/null
+      #
+      # Retry loop around that same class of readiness gap, one layer
+      # deeper: confirmed live (twice, both times right after a heavy step
+      # just ahead of this one -- jenkins_tunnel once, jenkins_install's
+      # plugin-PVC rollout the other), --validate=false alone isn't enough
+      # on its own -- `kubectl apply` still failed with "unable to
+      # recognize STDIN: the server could not find the requested resource"
+      # because the apiserver's discovery/RESTMapper cache (which resolves
+      # "Namespace" to its API endpoint at all, upstream of any schema
+      # validation) hadn't caught up yet either. Looped instead of a fixed
+      # sleep for the same reason kubeconfig.sh's own waits are loops, not
+      # sleeps: how long this takes depends on how busy the apiserver
+      # actually is, not a number worth guessing at.
+      NS_YAML=$(kubectl create namespace observability --dry-run=client -o yaml)
+      NS_APPLIED=false
+      for i in $(seq 1 15); do
+        if echo "$NS_YAML" | kubectl apply --validate=false -f - >/dev/null 2>&1; then
+          NS_APPLIED=true
+          break
+        fi
+        echo "apiserver discovery not ready yet for namespace apply (attempt $i/15) -- retrying..."
+        sleep 2
+      done
+      if [ "$NS_APPLIED" != "true" ]; then
+        echo "observability namespace still not applyable after 15 attempts -- apiserver discovery never caught up." >&2
+        echo "$NS_YAML" | kubectl apply --validate=false -f -
+      fi
     EOT
   }
 }
