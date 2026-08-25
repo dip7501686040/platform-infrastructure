@@ -461,17 +461,34 @@ resource "terraform_data" "jenkins_install" {
       set -e
       source "${path.module}/scripts/kubeconfig.sh" "${module.eks.cluster_name}" "${module.eks.cluster_endpoint}"
 
-      # Force-delete jenkins-0 first if it's stuck Terminating/Unknown --
-      # same stale-kubelet-handoff class of issue k8s_reconcile already
-      # cleans up elsewhere in this file, but that pass runs once, early,
-      # right after k3s comes back up -- before Jenkins (by far the
-      # slowest pod here to boot, a full JVM + plugin load) has had time to
-      # reveal its own staleness. Confirmed live: a StatefulSet with an
-      # unchanged, correct spec does NOT self-heal a pod merely stuck in
-      # "Unknown" -- the controller only replaces a pod once it's actually
-      # gone, not just stale, so without this the pod sat broken until
-      # someone noticed and deleted it by hand.
-      STUCK=$(kubectl get pod jenkins-0 -n jenkins --no-headers 2>/dev/null | awk '$3=="Unknown" || $3=="Terminating"{print $1}')
+      # Force-delete jenkins-0 first if it's stuck Terminating/Unknown, or
+      # crash-looping -- same stale-kubelet-handoff class of issue
+      # k8s_reconcile already cleans up elsewhere in this file, but that
+      # pass runs once, early, right after k3s comes back up -- before
+      # Jenkins (by far the slowest pod here to boot, a full JVM + plugin
+      # load) has had time to reveal its own staleness. Confirmed live: a
+      # StatefulSet with an unchanged, correct spec does NOT self-heal a
+      # pod merely stuck in "Unknown" -- the controller only replaces a
+      # pod once it's actually gone, not just stale, so without this the
+      # pod sat broken until someone noticed and deleted it by hand.
+      #
+      # CrashLoopBackOff/Init:CrashLoopBackOff/Error added after the same
+      # class of thing happened a second way: the plugin init container's
+      # own copy step uses interactive `cp -i`, and plugin-dir (an
+      # emptyDir -- persists across container restarts *within* the same
+      # pod, unlike across pod recreation) still has whatever partial
+      # content an earlier interrupted attempt left behind, so every
+      # retry hits an overwrite prompt with no stdin to answer it and
+      # hangs/fails again -- confirmed live, 8 restarts over 28 minutes
+      # with no progress, sitting there until someone noticed. Original
+      # Unknown/Terminating check didn't catch it since the pod's own
+      # status was neither -- it was genuinely "Init:CrashLoopBackOff",
+      # a real state, just not one this was watching for yet. Matched by
+      # substring, not exact equality, so this also catches Init:Error
+      # without needing to enumerate every crash-adjacent status string
+      # Kubernetes can report -- deliberately not matching "Init:0/2" or
+      # similar normal in-progress states, which aren't crash-looping.
+      STUCK=$(kubectl get pod jenkins-0 -n jenkins --no-headers 2>/dev/null | awk '$3=="Unknown" || $3=="Terminating" || $3 ~ /CrashLoopBackOff/ || $3 ~ /Error/{print $1}')
       if [ -n "$STUCK" ]; then
         echo "jenkins-0 is stuck ($STUCK) -- force-deleting so the StatefulSet recreates it..."
         kubectl delete pod jenkins-0 -n jenkins --grace-period=0 --force >/dev/null 2>&1 || true
