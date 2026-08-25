@@ -75,13 +75,13 @@ module "loadbalancer" {
 
   manage_floci              = var.manage_floci
   name_prefix               = var.cluster_name
-  vpc_id                     = module.network.vpc_id
-  public_subnet_ids          = module.network.public_subnet_ids
-  cluster_security_group_id  = module.eks.cluster_security_group_id
-  node_group_asg_name        = module.eks.node_group_asg_name
-  floci_eks_container_name   = "floci-eks-${var.cluster_name}"
-  services                   = var.lb_services
-  tags                       = var.tags
+  vpc_id                    = module.network.vpc_id
+  public_subnet_ids         = module.network.public_subnet_ids
+  cluster_security_group_id = module.eks.cluster_security_group_id
+  node_group_asg_name       = module.eks.node_group_asg_name
+  floci_eks_container_name  = "floci-eks-${var.cluster_name}"
+  services                  = var.lb_services
+  tags                      = var.tags
 }
 
 # Makes the previously-manual "docker update --restart=unless-stopped on
@@ -493,31 +493,82 @@ resource "terraform_data" "jenkins_install" {
       CURRENT_HASH="${filesha256("${var.platform_gitops_path}/k8s/jenkins/values.yaml")}-${local_sensitive_file.jenkins_init_security.content_sha256}-${local_file.jenkins_seed_jobs.content_sha256}"
       if [ "$DEPLOYED_HASH" = "$CURRENT_HASH" ] && [ "$${READY:-0}" -ge 1 ]; then
         echo "Jenkins already deployed and healthy with unchanged config -- skipping helm upgrade."
-        exit 0
+      else
+        source "${path.module}/scripts/helm-unstick.sh" "jenkins" "jenkins"
+
+        helm repo add jenkins https://charts.jenkins.io >/dev/null 2>&1 || true
+        helm repo update jenkins >/dev/null 2>&1
+
+        # 20m, not 10m: this chart's plugin init container re-downloads every
+        # plugin from the internet into an ephemeral (not JENKINS_HOME-backed)
+        # volume on every single pod (re)start -- confirmed live, a restart
+        # forced by an initScripts content change took ~13m end to end,
+        # blowing past a 10m --wait and leaving `terraform apply` erroring out
+        # even though the pod finished starting less than a minute later on
+        # its own. The plugin-dir-to-PVC patch below fixes the persistence
+        # side of this (see its own comment) -- this timeout stays generous
+        # regardless, since a genuinely new plugin list still needs a real
+        # fresh download the first time either way.
+        helm upgrade --install jenkins jenkins/jenkins \
+          --namespace jenkins --create-namespace \
+          -f "${var.platform_gitops_path}/k8s/jenkins/values.yaml" \
+          --set-file "controller.initScripts.basic-security=${local_sensitive_file.jenkins_init_security.filename}" \
+          --set-file "controller.initScripts.seed-jobs=${local_file.jenkins_seed_jobs.filename}" \
+          --wait --timeout 20m
+
+        kubectl annotate statefulset jenkins -n jenkins config-hash="$CURRENT_HASH" --overwrite
       fi
 
-      source "${path.module}/scripts/helm-unstick.sh" "jenkins" "jenkins"
+      # Plugin persistence: templates/jenkins-controller-statefulset.yaml
+      # (jenkins/jenkins chart source, confirmed via `helm pull --untar`,
+      # not guessed) hardcodes plugin-dir -- the volume mounted at
+      # $JENKINS_HOME/plugins/ -- as `emptyDir: {}`, with no values.yaml
+      # key to override it. Every pod (re)start re-downloads every plugin
+      # from the internet into that empty volume from scratch (the ~13m
+      # figure above). Helm 4's --post-renderer requires a registered
+      # plugin (a Helm 3-style raw-script path errors "plugin ... not
+      # found") -- adding unversioned local machine state outside git for
+      # this felt like the wrong tradeoff, so this patches the rendered
+      # StatefulSet directly instead: create a real PVC, then repoint
+      # plugin-dir at it. Strategic-merge, not JSON-patch-by-index --
+      # PodSpec.volumes carries patchMergeKey=name, so this matches
+      # plugin-dir by name regardless of its position in the list, and
+      # explicitly nulls emptyDir since a Volume can only have one source
+      # set (leaving both would fail API validation). Only runs the
+      # patch+wait when needed (volume doesn't already point at the PVC)
+      # so an unrelated helm upgrade above doesn't force an extra restart
+      # every time -- confirmed live, helm upgrade re-applies the chart's
+      # own unpatched emptyDir on every run that actually executes, so
+      # this has to be unconditional relative to the if/else above, just
+      # not relative to its own already-applied state.
+      kubectl apply -f - <<'PVCEOF'
+kind: PersistentVolumeClaim
+apiVersion: v1
+metadata:
+  name: jenkins-plugins
+  namespace: jenkins
+  labels:
+    app.kubernetes.io/name: jenkins
+    app.kubernetes.io/instance: jenkins
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/component: jenkins-plugin-cache
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+PVCEOF
 
-      helm repo add jenkins https://charts.jenkins.io >/dev/null 2>&1 || true
-      helm repo update jenkins >/dev/null 2>&1
-
-      # 20m, not 10m: this chart's plugin init container re-downloads every
-      # plugin from the internet into an ephemeral (not JENKINS_HOME-backed)
-      # volume on every single pod (re)start -- confirmed live, a restart
-      # forced by an initScripts content change took ~13m end to end,
-      # blowing past a 10m --wait and leaving `terraform apply` erroring out
-      # even though the pod finished starting less than a minute later on
-      # its own. Not fixing the re-download-every-restart behavior itself
-      # here (that's its own, separate piece of work) -- just giving it
-      # enough runway to not race the timeout while it exists.
-      helm upgrade --install jenkins jenkins/jenkins \
-        --namespace jenkins --create-namespace \
-        -f "${var.platform_gitops_path}/k8s/jenkins/values.yaml" \
-        --set-file "controller.initScripts.basic-security=${local_sensitive_file.jenkins_init_security.filename}" \
-        --set-file "controller.initScripts.seed-jobs=${local_file.jenkins_seed_jobs.filename}" \
-        --wait --timeout 20m
-
-      kubectl annotate statefulset jenkins -n jenkins config-hash="$CURRENT_HASH" --overwrite
+      CURRENT_PLUGIN_VOL=$(kubectl get statefulset jenkins -n jenkins -o jsonpath='{.spec.template.spec.volumes[?(@.name=="plugin-dir")].persistentVolumeClaim.claimName}' 2>/dev/null || true)
+      if [ "$CURRENT_PLUGIN_VOL" != "jenkins-plugins" ]; then
+        echo "plugin-dir is still emptyDir -- patching it onto the jenkins-plugins PVC..."
+        kubectl patch statefulset jenkins -n jenkins --type=strategic -p \
+          '{"spec":{"template":{"spec":{"volumes":[{"name":"plugin-dir","emptyDir":null,"persistentVolumeClaim":{"claimName":"jenkins-plugins"}}]}}}}'
+        kubectl rollout status statefulset/jenkins -n jenkins --timeout=20m
+      fi
     EOT
   }
 }
@@ -1235,7 +1286,7 @@ resource "local_sensitive_file" "grafana_admin_password" {
 }
 
 resource "local_file" "grafana_values" {
-  content = <<-EOT
+  content  = <<-EOT
     adminUser: admin
     adminPassword: "${random_password.grafana_admin.result}"
 
