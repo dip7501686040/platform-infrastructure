@@ -499,6 +499,32 @@ resource "terraform_data" "jenkins_install" {
         helm repo add jenkins https://charts.jenkins.io >/dev/null 2>&1 || true
         helm repo update jenkins >/dev/null 2>&1
 
+        # Revert plugin-dir to the chart's own emptyDir *before* helm runs,
+        # if the earlier patch (below) has it on the PVC right now.
+        # Confirmed live: Helm 4 defaults to server-side apply, and it still
+        # renders plugin-dir as emptyDir (the chart has no override for
+        # this -- see the patch's own comment) on every upgrade. Applying
+        # that against a live object already holding persistentVolumeClaim
+        # doesn't replace the field, it merges the two field managers'
+        # views -- "StatefulSet.apps is invalid: may not specify more than
+        # 1 volume type" -- because SSA has no way to know the PVC field
+        # should be cleared when a *different* patch (kubectl patch,
+        # below) is what set it, not this same upgrade. Reverting first
+        # gives helm a clean object with nothing to conflict over; the
+        # patch step re-applies right after, same as it always did.
+        CURRENT_PLUGIN_VOL_PREUPGRADE=$(kubectl get statefulset jenkins -n jenkins -o jsonpath='{.spec.template.spec.volumes[?(@.name=="plugin-dir")].persistentVolumeClaim.claimName}' 2>/dev/null || true)
+        if [ "$CURRENT_PLUGIN_VOL_PREUPGRADE" = "jenkins-plugins" ]; then
+          echo "plugin-dir is on the PVC -- reverting to emptyDir before helm upgrade to avoid an SSA field conflict..."
+          # Strategic-merge, matched by name (patchMergeKey on
+          # PodSpec.volumes) -- not JSON-patch-by-index. The actual failure
+          # this is fixing showed plugin-dir at volumes[3]; hardcoding an
+          # index here would silently revert whatever volume happens to
+          # occupy that slot instead, which is exactly the fragility the
+          # original patch (below) was already written to avoid.
+          kubectl patch statefulset jenkins -n jenkins --type=strategic -p \
+            '{"spec":{"template":{"spec":{"volumes":[{"name":"plugin-dir","persistentVolumeClaim":null,"emptyDir":{}}]}}}}' 2>/dev/null || true
+        fi
+
         # 20m, not 10m: this chart's plugin init container re-downloads every
         # plugin from the internet into an ephemeral (not JENKINS_HOME-backed)
         # volume on every single pod (re)start -- confirmed live, a restart
