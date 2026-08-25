@@ -474,16 +474,22 @@ resource "terraform_data" "jenkins_install" {
       #
       # CrashLoopBackOff/Init:CrashLoopBackOff/Error added after the same
       # class of thing happened a second way: the plugin init container's
-      # own copy step uses interactive `cp -i`, and plugin-dir (an
-      # emptyDir -- persists across container restarts *within* the same
-      # pod, unlike across pod recreation) still has whatever partial
-      # content an earlier interrupted attempt left behind, so every
-      # retry hits an overwrite prompt with no stdin to answer it and
-      # hangs/fails again -- confirmed live, 8 restarts over 28 minutes
-      # with no progress, sitting there until someone noticed. Original
+      # own copy step (`yes n | cp -i ...` in the chart's own
+      # apply_config.sh, confirmed by reading the live ConfigMap directly
+      # -- already piped non-interactively, not the naive `cp -i` this
+      # comment originally, wrongly, assumed) sat crash-looping for 8
+      # restarts over 28 minutes with no progress. Root cause was more
+      # likely CPU starvation, not a deadlock in that command itself: this
+      # happened specifically during a mass concurrent restart (13
+      # nest-services + observability + ArgoCD + Jenkins all cold-starting
+      # at once, from a manual `kubectl delete pods --all`) that this
+      # init container's own 500m CPU limit can't do anything about when
+      # the whole node is this oversubscribed -- an otherwise-fast copy
+      # taking long enough to hit some external kill. Whatever the exact
+      # mechanism, the self-heal gap was real regardless: original
       # Unknown/Terminating check didn't catch it since the pod's own
-      # status was neither -- it was genuinely "Init:CrashLoopBackOff",
-      # a real state, just not one this was watching for yet. Matched by
+      # status was neither -- it was genuinely "Init:CrashLoopBackOff", a
+      # real state, just not one this was watching for yet. Matched by
       # substring, not exact equality, so this also catches Init:Error
       # without needing to enumerate every crash-adjacent status string
       # Kubernetes can report -- deliberately not matching "Init:0/2" or
