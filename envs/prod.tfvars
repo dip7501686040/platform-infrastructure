@@ -1,8 +1,23 @@
 # NOTE: aws_region is a placeholder — confirm the target region with the user
 # before running `terraform apply` against real AWS (see plan Risk #2).
-aws_region   = "us-east-1"
-cluster_name = "ai-notification"
-k8s_version  = "1.31"
+aws_region = "us-east-1"
+# Single-entry map, not the 4-cluster split -- Jenkins/ArgoCD/observability
+# aren't installed via Terraform on real AWS yet (every install resource in
+# main.tf is gated on var.manage_floci), so app_services is the only
+# cluster prod actually needs right now. See variables.tf's "clusters".
+clusters = {
+  app_services = { cluster_name = "ai-notification" }
+}
+k8s_version = "1.31"
+
+# Matches the deleted platform-gitops/k8s/environments/prod/values-backing-services.yaml
+# now that Postgres/RabbitMQ/Redis are Terraform-direct instead of a GitOps
+# chart (main.tf's postgres_install/rabbitmq_install/redis_install) -- real
+# AWS uses the gp3 EBS StorageClass instead of local-path. Currently inert
+# either way: those resources are still gated on manage_floci, same as
+# ArgoCD/Jenkins/observability, so nothing changes for prod until that gate
+# is deliberately lifted.
+backing_services_storage_class = "gp3"
 
 vpc_cidr           = "10.0.0.0/16"
 az_count           = 2
@@ -23,14 +38,10 @@ manage_floci = false
 # Ingress + AWS Load Balancer Controller, most likely) is separate,
 # unbuilt, deferred prod work — see platform-infrastructure's own plan notes.
 
-# 0 (default) — disabled. Whoever needs browser access sets this to a real
-# port on *their own* machine; it should never be baked into a shared/CI
-# apply of the prod env. Same reasoning for argocd — and both tunnels are
-# gated on manage_floci anyway (main.tf), so these are inert on prod
-# regardless. web/api-gateway need no local port at all here -- prod reaches
-# them at the ALB's real DNS name (outputs.web_url/api_gateway_url).
-jenkins_local_tunnel_port = 0
-argocd_local_tunnel_port  = 0
+# No local port config needed here at all -- every UI (web, api-gateway,
+# Jenkins, ArgoCD, Grafana, Prometheus, Jaeger) is reached at its own ALB's
+# real DNS name on real AWS (outputs.*_url), same mechanism, no
+# Floci-only localhost port publishing involved.
 
 tags = {
   Project     = "ai-notification-system"

@@ -1,11 +1,19 @@
-# cluster_name is intentionally left as "ai-notification-floci" rather than
+# app_services keeps the name "ai-notification-floci" rather than being
 # renamed to match this file — EKS cluster names are immutable in AWS
 # (rename = destroy/recreate), and this pass already has a live cluster in
 # envs/state/local.tfstate. Only the file/tag naming moved to local/prod;
-# renaming provisioned resources is a separate, deliberate decision.
-aws_region   = "us-east-1"
-cluster_name = "ai-notification-floci"
-k8s_version  = "1.31"
+# renaming provisioned resources is a separate, deliberate decision. The
+# other 3 are new clusters (Phase 1 of the 4-cluster split) with no prior
+# state to preserve, so they're free to name plainly.
+aws_region = "us-east-1"
+clusters = {
+  jenkins          = { cluster_name = "floci-jenkins" }
+  argocd           = { cluster_name = "floci-argocd" }
+  observability    = { cluster_name = "floci-observability" }
+  app_services     = { cluster_name = "ai-notification-floci" }
+  backing_services = { cluster_name = "floci-backing-services" }
+}
+k8s_version = "1.31"
 
 # Terraform starts (and, if missing, pulls) the floci/floci container itself
 # via module.floci — no manual `docker run` needed before `terraform apply`.
@@ -29,21 +37,12 @@ enable_irsa_addons = false
 # in main.tf), not a dedicated EC2 instance — no jenkins_mode/instance_type/
 # admin_cidr needed anymore.
 
-# Browser access via a Terraform-managed kubectl port-forward — see
-# jenkins_tunnel in main.tf. http://localhost:8091 once applied.
-jenkins_local_tunnel_port = 8091
-
-# Same pattern for the ArgoCD UI (argocd_tunnel) — https://localhost:8090
-# once applied. web/api-gateway aren't tunneled anymore -- they're reached
-# through the ALB instead (alb_web_local_port/alb_api_gateway_local_port,
-# defaults 8080/8000 -- see modules/loadbalancer and modules/floci's
-# extra_ports).
-argocd_local_tunnel_port = 8090
-
-# Observability platform (main.tf) -- Grafana/Prometheus/Jaeger UIs.
-grafana_local_tunnel_port    = 8092
-prometheus_local_tunnel_port = 8093
-jaeger_local_tunnel_port     = 8094
+# Every human-facing UI (web, api-gateway, Jenkins, ArgoCD, Grafana,
+# Prometheus, Jaeger) is reached through its own cluster's ALB now -- no
+# kubectl port-forward tunnels anywhere. See the alb_*_local_port variables
+# in variables.tf for the actual localhost URLs (defaults: web 8080,
+# api-gateway 8000, jenkins 8091, argocd 8092, grafana 8093, prometheus
+# 8094, jaeger 8095) -- not overridden here since the defaults already fit.
 
 tags = {
   Project     = "ai-notification-system"

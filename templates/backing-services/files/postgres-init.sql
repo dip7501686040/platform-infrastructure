@@ -1,0 +1,9 @@
+CREATE DATABASE identity_db;
+CREATE DATABASE tenant_db;
+CREATE DATABASE event_db;
+CREATE DATABASE ai_db;
+CREATE DATABASE rule_engine_db;
+CREATE DATABASE notification_db;
+CREATE DATABASE template_db;
+CREATE DATABASE analytics_db;
+CREATE DATABASE audit_db;
