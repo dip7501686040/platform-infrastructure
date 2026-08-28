@@ -16,24 +16,6 @@ locals {
   target_type = var.manage_floci ? "ip" : "instance"
 }
 
-# Floci only: resolve the k3s node container's own Docker bridge IP -- the
-# only address describe-target-health can actually reach it at. Same
-# docker-inspect-for-IP pattern as this repo's ensure_registry_pull_mirror
-# (main.tf) uses for the ECR registry container's address.
-data "external" "floci_eks_ip" {
-  count = var.manage_floci ? 1 : 0
-
-  program = ["bash", "-c", <<-EOT
-    ip=$(docker inspect "${var.floci_eks_container_name}" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')
-    if [ -z "$ip" ]; then
-      echo "could not resolve ${var.floci_eks_container_name}'s IP -- is it running?" >&2
-      exit 1
-    fi
-    printf '{"ip": "%s"}' "$ip"
-  EOT
-  ]
-}
-
 # Real AWS only -- Floci doesn't enforce security groups against actual
 # routing (ELBv2's SetSecurityGroups just stores the IDs), so there's
 # nothing for this to gate locally.
@@ -118,7 +100,7 @@ resource "aws_lb_target_group_attachment" "floci" {
   for_each = var.manage_floci ? var.services : {}
 
   target_group_arn = aws_lb_target_group.this[each.key].arn
-  target_id        = data.external.floci_eks_ip[0].result.ip
+  target_id        = var.static_ip
   port             = each.value.node_port
 }
 
@@ -133,8 +115,8 @@ resource "aws_lb_listener" "this" {
   for_each = var.services
 
   load_balancer_arn = aws_lb.this.arn
-  port               = each.value.listener_port
-  protocol           = "HTTP"
+  port              = each.value.listener_port
+  protocol          = "HTTP"
 
   default_action {
     type             = "forward"

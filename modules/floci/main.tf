@@ -62,6 +62,41 @@ resource "docker_container" "floci" {
   # survive between applies (and restart with the host/Docker daemon).
   restart  = "unless-stopped"
   must_run = true
+
+  # kreuzwerker/docker 3.9.0 re-serializes `ports` from Docker's own
+  # NetworkSettings.Ports map (unordered in the Docker API) into an ordered
+  # list on every refresh -- confirmed live, the exact same 8 port mappings
+  # come back in a different list order from one plan to the next with
+  # nothing in `var.extra_ports` having changed, so every plan proposes
+  # replacing this container purely to "reorder" entries that are already
+  # correct. Twice live this actually broke things: bundled into a larger
+  # apply alongside other -target resources, the destroy-then-create replace
+  # this spurious diff triggers lost its own ordering race against Docker's
+  # own container-name uniqueness check ("Conflict: /floci already in use"),
+  # aborting the whole apply -- not a one-off, reproduced identically twice.
+  # An isolated single-target apply of just this resource *does* complete
+  # the replace correctly (named volumes/socket mount reattach fine), so
+  # this isn't corrupting anything when it fires -- it's just firing on
+  # every apply for no real reason, and unsafe to leave doing so bundled
+  # with anything else. `extra_ports` changing (a genuinely new service
+  # added to the ALB, a rare event) needs `terraform apply
+  # -replace=module.floci[0].docker_container.floci` from here on instead
+  # of happening automatically -- an explicit, deliberate step is the right
+  # tradeoff against a container that can spontaneously and unsafely
+  # recreate itself on any unrelated apply.
+  #
+  # `cpus` ignored too, for an unrelated reason: this container's actual
+  # cap is managed live by scripts/cpu-priority.sh (`docker update --cpus`,
+  # outside Terraform entirely -- see that script's own comment) so it
+  # always has a real value here that this resource's config never
+  # declares. Without ignoring it, every plan sees that as drift ("0.8" ->
+  # null) and -- confirmed live -- `cpus` is *also* a forces-replacement
+  # attribute for this provider, so it started proposing the exact same
+  # unsafe bundled-replace this whole lifecycle block exists to stop, for
+  # a completely different reason than the ports one above.
+  lifecycle {
+    ignore_changes = [ports, cpus]
+  }
 }
 
 # docker_container reports "running" as soon as the process starts, not once

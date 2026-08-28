@@ -25,7 +25,8 @@ provider "registry.terraform.io/hashicorp/aws" {
 }
 
 provider "registry.terraform.io/hashicorp/external" {
-  version = "2.4.1"
+  version     = "2.4.1"
+  constraints = "~> 2.3"
   hashes = [
     "h1:pNEBlwrLd7hJ+bBZwxVM3jfV9HmsueDD83xyXAFEQR8=",
     "zh:4729bb3f5a6162c6662e51ddd6fce39206632c98109db9969fba65fd063da1af",
