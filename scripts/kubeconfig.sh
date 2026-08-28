@@ -8,11 +8,39 @@
 # Pulled out of k8s_reconcile/app_secrets/argocd_install/argocd_manifests
 # (main.tf), which all repeated this same "docker exec ... k3s.yaml | sed ...
 # > kubeconfig" block — single-sourced here instead.
+#
+# Writes to envs/state/kubeconfig-<cluster_name>, not one shared
+# envs/state/kubeconfig — now that jenkins/argocd/observability/app_services
+# are 4 separate clusters, a single shared file meant whichever cluster last
+# called this script silently won it, with no way for a human (or a script
+# targeting more than one cluster in the same apply) to reliably address a
+# specific one. Each cluster now gets its own stable path:
+#   export KUBECONFIG=~/platform-infrastructure/envs/state/kubeconfig-floci-jenkins
+#   export KUBECONFIG=~/platform-infrastructure/envs/state/kubeconfig-floci-argocd
+#   export KUBECONFIG=~/platform-infrastructure/envs/state/kubeconfig-floci-observability
+#   export KUBECONFIG=~/platform-infrastructure/envs/state/kubeconfig-ai-notification-floci
+# (the suffix is each cluster's cluster_name from envs/local.tfvars, not its
+# var.clusters map key — matches the $1 this script is actually called
+# with). No caller in main.tf hardcodes the old shared filename — every one
+# of them only relies on the exported KUBECONFIG env var this script sets in
+# the calling shell, not the path itself — so this rename needed no other
+# changes.
 set -e
 
 _kc_cluster_name="$1"
 _kc_cluster_endpoint="$2"
 _kc_container="floci-eks-${_kc_cluster_name}"
+
+# Boosts this cluster's own CPU ceiling and throttles every OTHER
+# floci-eks-* container down to a bare-minimum share -- see
+# cpu-priority.sh's own comment for the full story (hard cgroup quotas via
+# `docker update --cpus`, sized so combined usage across every cluster
+# stays ~200% even in the worst case). Every terraform_data resource in
+# this repo sources this script as its first action, so this single call
+# is what makes "whichever cluster is actively being worked on gets CPU
+# priority, every other one waits" apply automatically everywhere, without
+# each install step needing its own copy of this logic.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cpu-priority.sh" "$_kc_container"
 
 # Every consumer of this script (k8s_reconcile, argocd_install,
 # jenkins_install, app_secrets, every tunnel) assumed this container was
@@ -79,7 +107,7 @@ for i in $(seq 1 30); do
   sleep 2
 done
 
-KUBECONFIG="$(dirname "${BASH_SOURCE[0]}")/../envs/state/kubeconfig"
+KUBECONFIG="$(dirname "${BASH_SOURCE[0]}")/../envs/state/kubeconfig-${_kc_cluster_name}"
 export KUBECONFIG
 
 # insecure-skip-tls-verify instead of trusting the embedded CA cert:

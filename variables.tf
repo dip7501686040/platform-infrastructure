@@ -15,9 +15,20 @@ variable "platform_gitops_path" {
   default     = "../platform-gitops"
 }
 
-variable "cluster_name" {
-  description = "Name of the EKS cluster"
-  type        = string
+variable "clusters" {
+  description = <<-EOT
+    Independent Floci-emulated EKS clusters, keyed by role. The Floci/local
+    pass defines 4 (jenkins/argocd/observability/app_services) so each
+    workload class gets its own failure domain instead of cold-starting
+    together in one shared k3s node; real AWS (envs/prod.tfvars) only ever
+    defines "app_services" -- Jenkins/ArgoCD/observability aren't installed
+    via Terraform there yet regardless (every install resource below is
+    gated on var.manage_floci), so a single-entry map is a no-op change
+    for prod, not a partial migration of it.
+  EOT
+  type = map(object({
+    cluster_name = string
+  }))
 }
 
 variable "k8s_version" {
@@ -78,50 +89,54 @@ variable "enable_irsa_addons" {
   default     = false
 }
 
-variable "jenkins_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Jenkins Service's port 8080. 0 disables it (default) — leave disabled on any box that isn't a human's dev machine."
-  type        = number
-  default     = 0
-}
-
-# Floci only -- real AWS reaches the ALB at its actual DNS name, no local
-# port publishing involved. web/api-gateway are reached exclusively through
-# the ALB now (no kubectl-port-forward tunnel anymore -- see git history for
-# the removed web_tunnel resource).
+# Floci only -- real AWS reaches each ALB at its actual DNS name, no local
+# port publishing involved. Every human-facing UI in this stack (web,
+# api-gateway, Jenkins, ArgoCD, Grafana, Prometheus, Jaeger) is reached
+# exclusively through its cluster's own ALB now -- no kubectl port-forward
+# tunnels anywhere (the old *_local_tunnel_port variables and their
+# terraform_data.*_tunnel resources are gone; each of these clusters gets
+# its own module.loadbalancer instance in main.tf instead, same pattern
+# app_services' web/api-gateway ALB already used).
 variable "alb_web_local_port" {
-  description = "Local Mac port the ALB's web listener (inside the floci container's own netns) is published on."
+  description = "Local Mac port the app_services ALB's web listener is published on."
   type        = number
   default     = 8080
 }
 
 variable "alb_api_gateway_local_port" {
-  description = "Local Mac port the ALB's api-gateway listener is published on. Defaults to 8000 to match NEXT_PUBLIC_API_URL's own default -- no web-side config change needed."
+  description = "Local Mac port the app_services ALB's api-gateway listener is published on. Defaults to 8000 to match NEXT_PUBLIC_API_URL's own default -- no web-side config change needed."
   type        = number
   default     = 8000
 }
 
-variable "argocd_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the ArgoCD server Service's port 443 (TLS, self-signed — expect a browser warning). 0 disables it (default) — leave disabled on any box that isn't a human's dev machine."
+variable "alb_jenkins_local_port" {
+  description = "Local Mac port the jenkins cluster's ALB listener is published on."
   type        = number
-  default     = 0
+  default     = 8091
 }
 
-variable "grafana_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Grafana Service's port 80. 0 disables it (default)."
+variable "alb_argocd_local_port" {
+  description = "Local Mac port the argocd cluster's ALB listener is published on. Served plain HTTP (server.extraArgs: [\"--insecure\"] in values-core.yaml) -- an HTTP-only ALB target group can't front an HTTPS backend."
   type        = number
-  default     = 0
+  default     = 8092
 }
 
-variable "prometheus_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Prometheus server Service's port 80. 0 disables it (default)."
+variable "alb_grafana_local_port" {
+  description = "Local Mac port the observability cluster ALB's Grafana listener is published on."
   type        = number
-  default     = 0
+  default     = 8093
 }
 
-variable "jaeger_local_tunnel_port" {
-  description = "Local Mac port for a Terraform-managed kubectl port-forward to the Jaeger query UI's port 16686. 0 disables it (default)."
+variable "alb_prometheus_local_port" {
+  description = "Local Mac port the observability cluster ALB's Prometheus listener is published on."
   type        = number
-  default     = 0
+  default     = 8094
+}
+
+variable "alb_jaeger_local_port" {
+  description = "Local Mac port the observability cluster ALB's Jaeger listener is published on."
+  type        = number
+  default     = 8095
 }
 
 variable "lb_services" {
@@ -250,4 +265,43 @@ variable "github_push_token" {
   type        = string
   sensitive   = true
   default     = ""
+}
+
+# ---------------------------------------------------------------------------
+# Backing services (Postgres/RabbitMQ/Redis) -- Terraform-direct now, not a
+# GitOps chart (see main.tf's postgres_install/rabbitmq_install/redis_install
+# and templates/backing-services/*.tftpl). "" for storage_class uses the
+# cluster's default StorageClass (Floci's k3s ships local-path out of the
+# box); real AWS would set this to "gp3" once that StorageClass exists.
+# ---------------------------------------------------------------------------
+
+variable "backing_services_storage_class" {
+  description = "StorageClass for Postgres/RabbitMQ's PVCs. \"\" uses the cluster default."
+  type        = string
+  default     = ""
+}
+
+variable "backing_services_postgres_image" {
+  type    = string
+  default = "postgres:16-alpine"
+}
+
+variable "backing_services_postgres_storage_size" {
+  type    = string
+  default = "2Gi"
+}
+
+variable "backing_services_rabbitmq_image" {
+  type    = string
+  default = "rabbitmq:3-management-alpine"
+}
+
+variable "backing_services_rabbitmq_storage_size" {
+  type    = string
+  default = "1Gi"
+}
+
+variable "backing_services_redis_image" {
+  type    = string
+  default = "redis:7-alpine"
 }

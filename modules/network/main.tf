@@ -1,9 +1,25 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
+# Pinned var.availability_zones, not a data "aws_availability_zones" lookup
+# -- confirmed live, that data source's own result becomes "known after
+# apply" (not resolvable during plan) for every cluster whose
+# module.network_<x> carries a module-level depends_on reaching a
+# terraform_data resource that's itself always being destroyed+recreated
+# (this project's own "always_run = timestamp()" self-healing pattern, used
+# everywhere -- module-level depends_on forces that same
+# not-known-until-apply deferral onto every data source inside the module
+# too, not just its resources, which is the actual documented Terraform
+# behavior at play here, not Floci flakiness -- a standalone test against
+# Floci directly showed the AZ list is perfectly stable/ordered on its own).
+# Since availability_zone is a ForceNew attribute on aws_subnet, "known
+# value in state vs unknown in the new plan" was enough on its own to force
+# a full replace of every subnet (+ everything downstream: NAT gateway,
+# route table associations, the EKS node group) on a cluster that was
+# already up and running, on every single future apply -- exactly the kind
+# of unnecessary, disruptive rebuild this project's idempotency work is
+# meant to prevent. A plain variable has no such problem: it's a literal
+# value, never "unknown," regardless of what else in the module is waiting
+# on an apply-time result.
 locals {
-  azs = slice(data.aws_availability_zones.available.names, 0, var.az_count)
+  azs = slice(var.availability_zones, 0, var.az_count)
 }
 
 resource "aws_vpc" "this" {

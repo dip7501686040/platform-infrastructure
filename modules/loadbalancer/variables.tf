@@ -34,6 +34,16 @@ variable "floci_eks_container_name" {
   default = null
 }
 
+# Floci only -- fixed IP on the floci-static Docker network (see
+# local.static_ips in the root main.tf). Passed straight through instead of
+# resolved via `docker inspect` at apply time, since the default bridge
+# network doesn't guarantee IP stability across container restarts but
+# floci-static does.
+variable "static_ip" {
+  type    = string
+  default = null
+}
+
 variable "services" {
   description = <<-EOT
     Public-facing services to front with the ALB. Each gets its own listener
