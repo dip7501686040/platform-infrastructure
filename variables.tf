@@ -267,6 +267,19 @@ variable "github_push_token" {
   default     = ""
 }
 
+variable "dockerhub_username" {
+  description = "Docker Hub username the CI build pushes images under (docker.io/<username>/ai-notification-<service>). Seeded into the Jenkins credential store (id: dockerhub) at boot."
+  type        = string
+  default     = ""
+}
+
+variable "dockerhub_token" {
+  description = "Docker Hub access token (or password) paired with dockerhub_username. Empty = skip the Docker Hub push, build to the Floci ECR only."
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
 # ---------------------------------------------------------------------------
 # Backing services (Postgres/RabbitMQ/Redis) -- Terraform-direct now, not a
 # GitOps chart (see main.tf's postgres_install/rabbitmq_install/redis_install

@@ -16,18 +16,33 @@ instance.setAuthorizationStrategy(strategy)
 
 instance.save()
 
-%{ if github_push_token != "" }
 def credsStore = SystemCredentialsProvider.getInstance().getStore()
 def domain = Domain.global()
-def alreadyExists = credsStore.getCredentials(domain).any { it.id == "github-push" }
-if (!alreadyExists) {
-  def cred = new UsernamePasswordCredentialsImpl(
-    CredentialsScope.GLOBAL,
-    "github-push",
-    "GitHub push credential for CI tag-bump commits to platform-gitops",
-    "${github_push_username}",
-    "${github_push_token}"
-  )
-  credsStore.addCredentials(domain, cred)
+
+def upsertCredential = { id, description, username, secret ->
+  def existing = credsStore.getCredentials(domain).find { it.id == id }
+  if (existing != null) {
+    credsStore.removeCredentials(domain, existing)
+  }
+  credsStore.addCredentials(domain, new UsernamePasswordCredentialsImpl(
+    CredentialsScope.GLOBAL, id, description, username, secret
+  ))
 }
+
+%{ if github_push_token != "" }
+upsertCredential(
+  "github-push",
+  "GitHub push credential for CI tag-bump commits to platform-gitops",
+  "${github_push_username}",
+  "${github_push_token}"
+)
+%{ endif }
+
+%{ if dockerhub_token != "" }
+upsertCredential(
+  "dockerhub",
+  "Docker Hub credential for CI image pushes (docker.io/${dockerhub_username})",
+  "${dockerhub_username}",
+  "${dockerhub_token}"
+)
 %{ endif }

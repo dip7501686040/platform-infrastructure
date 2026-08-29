@@ -25,9 +25,9 @@ locals {
   # way it reaches otel-collector cross-cluster: a NodePort here, addressed
   # by a stub Service+Endpoints on the consuming side (see
   # backing_services_cross_cluster_stub below).
-  postgres_node_port      = 30432
-  rabbitmq_amqp_node_port = 30672
-  redis_node_port         = 30679
+  postgres_node_port            = 30432
+  rabbitmq_amqp_node_port       = 30672
+  redis_node_port               = 30679
   rabbitmq_prometheus_node_port = 30692
   api_gateway_metrics_node_port = 30964
 
@@ -72,6 +72,23 @@ locals {
     observability    = "172.30.0.13"
     backing_services = "172.30.0.14"
     ecr_registry     = "172.30.0.20"
+
+    # The plain Docker containers (argocd's 5 processes + jenkins + jaeger/
+    # prometheus/grafana) originally had no pinned IP, so Docker auto-
+    # assigned them from the low end of 172.30.0.0/24 -- confirmed live,
+    # one landed on 172.30.0.10 and collided with the app_services k3s
+    # node's reserved address, disconnecting it. Pinned here, all above
+    # .20, so a recreate can never drift back into the reserved 10-20
+    # range. otel-collector already had its own pin (= observability .13).
+    jenkins_pin                      = "172.30.0.21"
+    argocd_redis                     = "172.30.0.22"
+    argocd_repo_server               = "172.30.0.23"
+    argocd_application_controller    = "172.30.0.24"
+    argocd_applicationset_controller = "172.30.0.25"
+    argocd_server                    = "172.30.0.26"
+    jaeger                           = "172.30.0.27"
+    prometheus                       = "172.30.0.28"
+    grafana                          = "172.30.0.29"
   }
 }
 
@@ -129,6 +146,47 @@ module "ecr" {
 
   repository_names = var.ecr_repository_names
   tags             = var.tags
+}
+
+# Put floci-ecr-registry on floci-static at its pinned IP.
+#
+# terraform_data.ensure_registry_pull_mirror already does this, but only as
+# part of the app_services cluster chain -- a scoped `-target` apply of just
+# floci + ecr + jenkins (the CI-only bring-up) never reaches it, leaving the
+# registry on Docker's default bridge with an unstable address that
+# jenkins/kaniko on floci-static can't reliably reach. This resource is that
+# one wiring step, standalone and idempotent, so the scoped apply is
+# self-sufficient. Floci creates the registry container lazily (on first
+# repo use / first push), so this waits for it rather than assuming it's
+# already there.
+resource "terraform_data" "ensure_ecr_registry_network" {
+  count      = var.manage_floci ? 1 : 0
+  depends_on = [module.ecr, terraform_data.ensure_static_network]
+
+  triggers_replace = { always_run = timestamp() }
+
+  provisioner "local-exec" {
+    interpreter = ["/bin/bash", "-c"]
+    command     = <<-EOT
+      set -e
+      REGISTRY_IP="${local.static_ips.ecr_registry}"
+
+      for i in $(seq 1 30); do
+        docker inspect floci-ecr-registry >/dev/null 2>&1 && break
+        [ "$i" = "30" ] && { echo "floci-ecr-registry never appeared -- Floci may only create it on first push; re-run this apply once it exists." >&2; exit 0; }
+        sleep 2
+      done
+
+      CURRENT_IP=$(docker inspect floci-ecr-registry --format '{{(index .NetworkSettings.Networks "floci-static").IPAddress}}' 2>/dev/null || true)
+      if [ "$CURRENT_IP" != "$REGISTRY_IP" ]; then
+        docker network disconnect floci-static floci-ecr-registry 2>/dev/null || true
+        docker network connect --ip "$REGISTRY_IP" floci-static floci-ecr-registry
+        echo "floci-ecr-registry attached to floci-static at $REGISTRY_IP."
+      else
+        echo "floci-ecr-registry already on floci-static at $REGISTRY_IP."
+      fi
+    EOT
+  }
 }
 
 # ---------------------------------------------------------------------------
@@ -1200,6 +1258,12 @@ resource "local_sensitive_file" "jenkins_init_security" {
     admin_password       = random_password.jenkins_admin.result
     github_push_username = var.github_push_username
     github_push_token    = var.github_push_token
+    # Seeded as a Jenkins "username/password" credential (id: dockerhub) --
+    # the build pipeline binds it to write a kaniko ~/.docker/config.json so
+    # the Docker Hub `--destination` push authenticates. Empty token skips
+    # the credential entirely (ECR-only build still works).
+    dockerhub_username = var.dockerhub_username
+    dockerhub_token    = var.dockerhub_token
   })
   filename        = "${path.root}/envs/state/jenkins-init-security.groovy"
   file_permission = "0600"
@@ -1208,29 +1272,36 @@ resource "local_sensitive_file" "jenkins_init_security" {
 resource "local_file" "jenkins_seed_jobs" {
   content = templatefile("${path.module}/templates/jenkins/seed-jobs.groovy.tftpl", {
     git_repo_url         = "https://github.com/dip7501686040/platform-gitops.git"
-    git_branch            = "main"
+    git_branch           = "main"
     services_groovy_list = join(", ", [for s in var.ecr_repository_names : "\"${s}\""])
   })
   filename = "${path.root}/envs/state/jenkins-seed-jobs.groovy"
 }
 
-# Versions pinned for the same reason platform-gitops' old Helm values did
-# -- an unpinned "latest" resolve reliably wedges the plugin installer on
-# this connection.
-resource "local_file" "jenkins_plugins_txt" {
-  content  = <<-EOT
-    git:5.10.1
-    workflow-aggregator:608.v67378e9d3db_1
-    credentials-binding:728.v902a_273b_8947
-    credentials:1511.v2e3cb_0008ef0
-    configuration-as-code:2117.vc05a_0b_e6b_f4e
-  EOT
-  filename = "${path.root}/envs/state/jenkins-plugins.txt"
-}
+# The pinned plugin set now lives at templates/jenkins/plugins.txt and is
+# installed into the image at build time (see the Dockerfile) -- stock
+# jenkins/jenkins:lts does not install from a runtime-mounted plugins.txt,
+# so the old Terraform-generated + bind-mounted file installed nothing.
 
+# Built locally from templates/jenkins/Dockerfile (stock Jenkins LTS + the
+# pinned plugins + a static `docker` CLI) -- this Jenkins has no k8s build
+# agents, so pipelines build images by shelling `docker build` / `docker
+# run` against the mounted host socket. `triggers` forces a rebuild when the
+# Dockerfile or plugin list changes; keep_locally stops a rebuild/repull on
+# every unrelated apply.
 resource "docker_image" "jenkins" {
-  name         = "jenkins/jenkins:lts"
+  name         = "floci-jenkins:local"
   keep_locally = true
+
+  build {
+    context    = "${path.module}/templates/jenkins"
+    dockerfile = "Dockerfile"
+  }
+
+  triggers = {
+    dockerfile_sha = filesha256("${path.module}/templates/jenkins/Dockerfile")
+    plugins_sha    = filesha256("${path.module}/templates/jenkins/plugins.txt")
+  }
 }
 
 resource "docker_volume" "jenkins_home" {
@@ -1242,20 +1313,47 @@ resource "docker_container" "jenkins" {
   name  = "floci-jenkins"
   image = docker_image.jenkins.image_id
 
+  # networks_advanced references floci-static by name -- it must exist
+  # before this container is created. Nothing in the attribute graph
+  # otherwise links the two (the network is made by a local-exec
+  # provisioner, not a docker_network resource), so pin the order
+  # explicitly. ensure_ecr_registry_network is included so the registry is
+  # already reachable at its static IP the moment Jenkins is up.
+  depends_on = [
+    terraform_data.ensure_static_network,
+    terraform_data.ensure_ecr_registry_network,
+  ]
+
+  # Root, not the image's `jenkins` (uid 1000): the bind-mounted host
+  # /var/run/docker.sock is root-owned and Docker Desktop exposes no stable
+  # gid to add `jenkins` to, so any `docker` call from a pipeline would hit
+  # EACCES otherwise. Same no-real-trust-boundary-locally stance the Jaeger
+  # container already takes (`user = "0:0"`), not a new exception. $JENKINS_HOME
+  # on the named volume stays writable as root.
+  user = "0:0"
+
   # runSetupWizard=false -- init-security.groovy below seeds the admin
   # account immediately instead, same as the old Helm values' jenkinsOpts.
   #
   # CONFIG_HASH: unused by Jenkins itself -- its only purpose is forcing
-  # Terraform to recreate this container whenever any of the 3 mounted
-  # init.groovy.d/plugins.txt files change. Init scripts and plugins.txt
-  # are read ONCE at JVM boot, there's no live-reload concept for them the
-  # way Prometheus has /-/reload -- a recreate is the only way a content
-  # change ever takes effect. Safe specifically because build history/jobs/
-  # credentials live on the separate `floci-jenkins-home` named volume
-  # below, untouched by a container recreate.
+  # Terraform to recreate this container whenever either mounted
+  # init.groovy.d script changes. Init scripts are read ONCE at JVM boot,
+  # there's no live-reload concept for them -- a recreate is the only way a
+  # content change ever takes effect. Safe specifically because build
+  # history/jobs/credentials live on the separate `floci-jenkins-home`
+  # named volume below, untouched by a container recreate. (Plugin-list
+  # changes are handled at image-build time via docker_image.jenkins'
+  # triggers, which also replaces this container.)
+  #
+  # BUILD_SCRATCH_HOST: the *host* path of the /scratch bind-mount below.
+  # A pipeline that needs to hand a file to a sibling `docker run` can't use
+  # a path under $JENKINS_HOME -- that's a named volume, invisible to the
+  # host daemon doing the sibling run -- so it writes into /scratch here and
+  # references this host path in the sibling `-v`.
   env = [
     "JAVA_OPTS=-Djenkins.install.runSetupWizard=false",
-    "CONFIG_HASH=${sha256("${local_sensitive_file.jenkins_init_security.content}${local_file.jenkins_seed_jobs.content}${local_file.jenkins_plugins_txt.content}")}",
+    "CONFIG_HASH=${sha256("${local_sensitive_file.jenkins_init_security.content}${local_file.jenkins_seed_jobs.content}")}",
+    "BUILD_SCRATCH_HOST=${abspath("${path.root}/envs/state/jenkins-scratch")}",
   ]
 
   ports {
@@ -1271,14 +1369,34 @@ resource "docker_container" "jenkins" {
   }
 
   # ECR registry reachability (image pushes from CI builds) -- same
-  # floci-static network floci-ecr-registry itself is already on.
+  # floci-static network floci-ecr-registry itself is already on. kaniko
+  # `docker run`s launched from a pipeline also join this network
+  # (--network floci-static) so they reach the registry by its static IP.
+  # Pinned IP (above the reserved .10-.20 range) so a recreate can't drift
+  # into a k3s node's address.
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.jenkins_pin
   }
 
   volumes {
     volume_name    = docker_volume.jenkins_home.name
     container_path = "/var/jenkins_home"
+  }
+
+  # Host daemon socket -- pipelines build/push images via
+  # `docker run gcr.io/kaniko-project/executor ...` (no k8s agents here).
+  volumes {
+    host_path      = "/var/run/docker.sock"
+    container_path = "/var/run/docker.sock"
+  }
+
+  # Host-visible scratch dir (see KANIKO_SCRATCH_HOST above). Docker creates
+  # the host path if missing; it lives under envs/state/ with the rest of
+  # this env's generated artifacts.
+  volumes {
+    host_path      = abspath("${path.root}/envs/state/jenkins-scratch")
+    container_path = "/scratch"
   }
   volumes {
     host_path      = abspath(local_sensitive_file.jenkins_init_security.filename)
@@ -1288,11 +1406,6 @@ resource "docker_container" "jenkins" {
   volumes {
     host_path      = abspath(local_file.jenkins_seed_jobs.filename)
     container_path = "/usr/share/jenkins/ref/init.groovy.d/seed-jobs.groovy"
-    read_only      = true
-  }
-  volumes {
-    host_path      = abspath(local_file.jenkins_plugins_txt.filename)
-    container_path = "/usr/share/jenkins/ref/plugins.txt"
     read_only      = true
   }
 
@@ -1425,7 +1538,8 @@ resource "docker_container" "argocd_redis" {
   image = docker_image.argocd_redis.image_id
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.argocd_redis
   }
 
   restart  = "unless-stopped"
@@ -1440,7 +1554,8 @@ resource "docker_container" "argocd_repo_server" {
   command    = ["argocd-repo-server", "--redis", "floci-argocd-redis:6379"]
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.argocd_repo_server
   }
 
   restart  = "unless-stopped"
@@ -1461,7 +1576,8 @@ resource "docker_container" "argocd_application_controller" {
   env = ["KUBECONFIG=/tmp/kubeconfig", "ARGOCD_NAMESPACE=argocd"]
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.argocd_application_controller
   }
 
   volumes {
@@ -1487,7 +1603,8 @@ resource "docker_container" "argocd_applicationset_controller" {
   env = ["KUBECONFIG=/tmp/kubeconfig", "ARGOCD_NAMESPACE=argocd"]
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.argocd_applicationset_controller
   }
 
   volumes {
@@ -1523,7 +1640,8 @@ resource "docker_container" "argocd_server" {
   }
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.argocd_server
   }
 
   volumes {
@@ -1744,7 +1862,8 @@ resource "docker_container" "jaeger" {
   }
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.jaeger
   }
 
   volumes {
@@ -1885,7 +2004,8 @@ resource "docker_container" "prometheus" {
   }
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.prometheus
   }
 
   volumes {
@@ -1989,7 +2109,8 @@ resource "docker_container" "grafana" {
   }
 
   networks_advanced {
-    name = "floci-static"
+    name         = "floci-static"
+    ipv4_address = local.static_ips.grafana
   }
 
   volumes {

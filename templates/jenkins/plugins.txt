@@ -1,0 +1,13 @@
+# Installed into the image at build time by jenkins-plugin-cli (see
+# Dockerfile). The stock jenkins/jenkins:lts entrypoint does NOT install
+# from a runtime-mounted plugins.txt -- the previous Helm-based setup did,
+# which is why this list used to live in a Terraform-generated file.
+#
+# Versions pinned: an unpinned "latest" resolve has repeatedly wedged the
+# plugin installer on this connection. Keep the set minimal -- every plugin
+# here is used by seed-jobs.groovy or jenkins/Jenkinsfile in platform-gitops.
+git:5.10.1
+workflow-aggregator:608.v67378e9d3db_1
+credentials-binding:728.v902a_273b_8947
+credentials:1511.v2e3cb_0008ef0
+configuration-as-code:2117.vc05a_0b_e6b_f4e
