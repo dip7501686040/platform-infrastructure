@@ -31,6 +31,13 @@
 #   STOP_JENKINS=0       1 = stop floci-jenkins if it is running
 #   FORCE_ALL=0          1 = batch-restart all 13 even if they look healthy
 
+# Re-exec under real bash. `sh scripts/safe-restart.sh` ignores the shebang,
+# and on macOS `/bin/sh` is bash in POSIX mode -- BASH_VERSION is set but
+# process substitution `< <(...)` and arrays are disabled. Detect POSIX mode
+# via SHELLOPTS and re-exec plain bash.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+case ":${SHELLOPTS:-}:" in *:posix:*) exec bash "$0" "$@" ;; esac
+
 set -uo pipefail
 
 BATCH_SIZE="${BATCH_SIZE:-3}"
