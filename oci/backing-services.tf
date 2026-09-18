@@ -31,7 +31,7 @@ resource "kubernetes_secret" "app_secrets" {
     SMTP_PASSWORD      = ""
     STRIPE_SECRET_KEY  = ""
     STRIPE_WEBHOOK_SECRET = ""
-    GOOGLE_CLIENT_SECRET  = ""
+    GOOGLE_CLIENT_SECRET  = var.google_client_secret
   }
 
   type = "Opaque"
