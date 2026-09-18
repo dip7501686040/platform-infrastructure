@@ -40,4 +40,25 @@ resource "helm_release" "ingress_nginx" {
     name  = "controller.resources.limits.memory"
     value = "180Mi"
   }
+
+  # THE MISSING PIECE that actually made this free: without these,
+  # OKE's cloud-controller-manager defaults a new LoadBalancer Service to
+  # a fixed "100Mbps" shape -- a paid, non-Always-Free shape -- not the
+  # Flexible 10Mbps shape the plan always assumed. Confirmed live: this
+  # gap is exactly what showed up as real (small) spend against the
+  # budget alert. Dots in the annotation key are escaped for Helm's
+  # --set parser, which otherwise reads an unescaped "." as a nested map
+  # boundary rather than a literal character in the key name.
+  set {
+    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape"
+    value = "flexible"
+  }
+  set {
+    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape-flex-min"
+    value = "10"
+  }
+  set {
+    name  = "controller.service.annotations.service\\.beta\\.kubernetes\\.io/oci-load-balancer-shape-flex-max"
+    value = "10"
+  }
 }
