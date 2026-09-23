@@ -1304,6 +1304,7 @@ resource "local_file" "jenkins_seed_jobs" {
 # Dockerfile or plugin list changes; keep_locally stops a rebuild/repull on
 # every unrelated apply.
 resource "docker_image" "jenkins" {
+  count = var.manage_floci ? 1 : 0
   name         = "floci-jenkins:local"
   keep_locally = true
 
@@ -1319,13 +1320,14 @@ resource "docker_image" "jenkins" {
 }
 
 resource "docker_volume" "jenkins_home" {
+  count = var.manage_floci ? 1 : 0
   name = "floci-jenkins-home"
 }
 
 resource "docker_container" "jenkins" {
   count = var.manage_floci ? 1 : 0
   name  = "floci-jenkins"
-  image = docker_image.jenkins.image_id
+  image = docker_image.jenkins[0].image_id
 
   # networks_advanced references floci-static by name -- it must exist
   # before this container is created. Nothing in the attribute graph
@@ -1394,7 +1396,7 @@ resource "docker_container" "jenkins" {
   }
 
   volumes {
-    volume_name    = docker_volume.jenkins_home.name
+    volume_name    = docker_volume.jenkins_home[0].name
     container_path = "/var/jenkins_home"
   }
 
@@ -1443,11 +1445,13 @@ resource "docker_container" "jenkins" {
 # app_services was always the only cluster it actually needed to manage.
 
 resource "docker_image" "argocd" {
+  count = var.manage_floci ? 1 : 0
   name         = "quay.io/argoproj/argocd:v3.5.1"
   keep_locally = true
 }
 
 resource "docker_image" "argocd_redis" {
+  count = var.manage_floci ? 1 : 0
   name         = "redis:7-alpine"
   keep_locally = true
 }
@@ -1549,7 +1553,7 @@ resource "terraform_data" "argocd_bootstrap_configmaps" {
 resource "docker_container" "argocd_redis" {
   count = var.manage_floci ? 1 : 0
   name  = "floci-argocd-redis"
-  image = docker_image.argocd_redis.image_id
+  image = docker_image.argocd_redis[0].image_id
 
   networks_advanced {
     name         = "floci-static"
@@ -1564,7 +1568,7 @@ resource "docker_container" "argocd_repo_server" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.argocd_redis]
   name       = "floci-argocd-repo-server"
-  image      = docker_image.argocd.image_id
+  image      = docker_image.argocd[0].image_id
   command    = ["argocd-repo-server", "--redis", "floci-argocd-redis:6379"]
 
   networks_advanced {
@@ -1580,7 +1584,7 @@ resource "docker_container" "argocd_application_controller" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.argocd_repo_server, terraform_data.argocd_target_kubeconfig, terraform_data.argocd_bootstrap_configmaps]
   name       = "floci-argocd-application-controller"
-  image      = docker_image.argocd.image_id
+  image      = docker_image.argocd[0].image_id
   command = [
     "argocd-application-controller",
     "--redis", "floci-argocd-redis:6379",
@@ -1608,7 +1612,7 @@ resource "docker_container" "argocd_applicationset_controller" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.argocd_repo_server, terraform_data.argocd_target_kubeconfig, terraform_data.argocd_bootstrap_configmaps]
   name       = "floci-argocd-applicationset-controller"
-  image      = docker_image.argocd.image_id
+  image      = docker_image.argocd[0].image_id
   command = [
     "argocd-applicationset-controller",
     "--argocd-repo-server", "floci-argocd-repo-server:8081",
@@ -1635,7 +1639,7 @@ resource "docker_container" "argocd_server" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.argocd_repo_server, docker_container.argocd_application_controller, terraform_data.argocd_target_kubeconfig, terraform_data.argocd_bootstrap_configmaps]
   name       = "floci-argocd-server"
-  image      = docker_image.argocd.image_id
+  image      = docker_image.argocd[0].image_id
   # --insecure: plain HTTP on 8080 -- no real trust boundary to give up on a
   # purely local dev setup, and it's what makes a raw host-port publish
   # (below) usable straight from a browser without a self-signed-cert
@@ -1838,6 +1842,7 @@ PROJEOF
 # service), not cluster-object-count metrics.
 
 resource "docker_image" "jaeger" {
+  count = var.manage_floci ? 1 : 0
   name         = "jaegertracing/all-in-one:1.60"
   keep_locally = true
 }
@@ -1848,13 +1853,14 @@ resource "docker_image" "jaeger" {
 # Elasticsearch needed, matching this project's existing "single-instance,
 # no extra backing service" observability choices).
 resource "docker_volume" "jaeger_data" {
+  count = var.manage_floci ? 1 : 0
   name = "floci-jaeger-data"
 }
 
 resource "docker_container" "jaeger" {
   count = var.manage_floci ? 1 : 0
   name  = "floci-jaeger"
-  image = docker_image.jaeger.image_id
+  image = docker_image.jaeger[0].image_id
   # Confirmed live: the image's default non-root user can't mkdir inside
   # a freshly-created named volume (root-owned by default) --
   # "Error Creating Dir: /badger/key: permission denied", crash-looped
@@ -1881,7 +1887,7 @@ resource "docker_container" "jaeger" {
   }
 
   volumes {
-    volume_name    = docker_volume.jaeger_data.name
+    volume_name    = docker_volume.jaeger_data[0].name
     container_path = "/badger"
   }
 
@@ -1925,6 +1931,7 @@ resource "local_file" "otel_collector_config" {
 }
 
 resource "docker_image" "otel_collector" {
+  count = var.manage_floci ? 1 : 0
   name         = "otel/opentelemetry-collector-contrib:latest"
   keep_locally = true
 }
@@ -1933,7 +1940,7 @@ resource "docker_container" "otel_collector" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.jaeger]
   name       = "floci-otel-collector"
-  image      = docker_image.otel_collector.image_id
+  image      = docker_image.otel_collector[0].image_id
   command    = ["--config=/etc/otel-collector-config.yaml"]
   # otel-collector has no config hot-reload -- unused by the app itself,
   # forces a recreate (which re-mounts the already-updated file) whenever
@@ -1984,6 +1991,7 @@ resource "local_file" "prometheus_config" {
 }
 
 resource "docker_image" "prometheus" {
+  count = var.manage_floci ? 1 : 0
   name         = "prom/prometheus:latest"
   keep_locally = true
 }
@@ -1992,6 +2000,7 @@ resource "docker_image" "prometheus" {
 # metric (exactly what a load test needs to review afterward) was gone on
 # any restart, same gap Jaeger/Grafana had.
 resource "docker_volume" "prometheus_data" {
+  count = var.manage_floci ? 1 : 0
   name = "floci-prometheus-data"
 }
 
@@ -1999,7 +2008,7 @@ resource "docker_container" "prometheus" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.otel_collector]
   name       = "floci-prometheus"
-  image      = docker_image.prometheus.image_id
+  image      = docker_image.prometheus[0].image_id
   # --web.enable-lifecycle exposes POST /-/reload -- unlike
   # otel-collector/grafana/jenkins, Prometheus DOES support live config
   # reload, so this uses that instead of a recreate-on-hash-change trigger
@@ -2028,7 +2037,7 @@ resource "docker_container" "prometheus" {
     read_only      = true
   }
   volumes {
-    volume_name    = docker_volume.prometheus_data.name
+    volume_name    = docker_volume.prometheus_data[0].name
     container_path = "/prometheus"
   }
 
@@ -2090,6 +2099,7 @@ resource "local_file" "grafana_datasource" {
 }
 
 resource "docker_image" "grafana" {
+  count = var.manage_floci ? 1 : 0
   name         = "grafana/grafana:latest"
   keep_locally = true
 }
@@ -2099,6 +2109,7 @@ resource "docker_image" "grafana" {
 # Datasource provisioning itself is unaffected either way (re-applied from
 # the mounted file below on every boot regardless).
 resource "docker_volume" "grafana_data" {
+  count = var.manage_floci ? 1 : 0
   name = "floci-grafana-data"
 }
 
@@ -2106,7 +2117,7 @@ resource "docker_container" "grafana" {
   count      = var.manage_floci ? 1 : 0
   depends_on = [docker_container.prometheus]
   name       = "floci-grafana"
-  image      = docker_image.grafana.image_id
+  image      = docker_image.grafana[0].image_id
   # CONFIG_HASH: Grafana only reads datasource provisioning files at boot
   # (no live-reload for datasources specifically, unlike its dashboard
   # provisioner's optional polling) -- unused by the app, forces a
@@ -2133,7 +2144,7 @@ resource "docker_container" "grafana" {
     read_only      = true
   }
   volumes {
-    volume_name    = docker_volume.grafana_data.name
+    volume_name    = docker_volume.grafana_data[0].name
     container_path = "/var/lib/grafana"
   }
 

@@ -32,10 +32,23 @@ single_nat_gateway = true
 create_nat_gateway      = false
 nodes_in_public_subnets = true
 
-node_instance_types = ["t3.medium"]
+# t3.medium isn't Free-Tier-eligible -- this account is on AWS's "Free
+# Plan" (not "Paid Plan"), which hard-blocks launching any non-free-tier
+# instance type outright (confirmed live: every t3.medium launch attempt
+# failed with "InvalidParameterCombination: not eligible for Free Tier",
+# for 27 minutes straight, until this was caught and fixed -- user chose
+# to stay on Free Plan and use a free-tier type rather than upgrade).
+# m7i-flex.large is the best-specced option in ap-south-1's free-tier
+# list (`aws ec2 describe-instance-types --filters
+# Name=free-tier-eligible,Values=true`): 2 vCPU/8GB, comparable to the
+# OCI node's 2 OCPU/12GB. Also note: the account's default EC2
+# "Running On-Demand Standard instances" vCPU quota is 5 -- caps this at
+# 2 nodes (4 vCPU) without a separate quota-increase request, hence
+# max=2 not 3.
+node_instance_types = ["m7i-flex.large"]
 node_desired_size   = 2
 node_min_size       = 1
-node_max_size       = 3
+node_max_size       = 2
 
 enable_irsa_addons = true
 
