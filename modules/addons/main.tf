@@ -46,7 +46,17 @@ resource "aws_iam_role_policy_attachment" "ebs_csi" {
 }
 
 resource "aws_eks_addon" "ebs_csi" {
-  count = var.enable_irsa_addons ? 1 : 0
+  count      = var.enable_irsa_addons ? 1 : 0
+  # service_account_role_arn only creates an implicit dependency on the
+  # ROLE, not on the policy actually being attached to it -- confirmed
+  # live: with parallelism=1, Terraform still scheduled this addon before
+  # aws_iam_role_policy_attachment.ebs_csi (nothing forced an order
+  # between two otherwise-independent resources), so the controller pods
+  # started their AWS API health check against a role with zero
+  # permissions attached yet and crash-looped
+  # (ec2:DescribeAvailabilityZones: UnauthorizedOperation) until manually
+  # fixed. Explicit depends_on closes that race.
+  depends_on = [aws_iam_role_policy_attachment.ebs_csi]
 
   cluster_name             = var.cluster_name
   addon_name               = "aws-ebs-csi-driver"
