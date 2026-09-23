@@ -27,7 +27,7 @@ resource "kubernetes_secret" "app_secrets" {
     RABBITMQ_PASSWORD  = var.rabbitmq_password
     RABBITMQ_URL       = "amqp://notification:${var.rabbitmq_password}@rabbitmq:5672"
     ANTHROPIC_API_KEY  = ""
-    OPENAI_API_KEY     = ""
+    OPENAI_API_KEY     = var.openai_api_key
     SMTP_PASSWORD      = ""
     STRIPE_SECRET_KEY  = ""
     STRIPE_WEBHOOK_SECRET = ""
