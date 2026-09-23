@@ -69,14 +69,14 @@ resource "aws_subnet" "private" {
 }
 
 resource "aws_eip" "nat" {
-  count = var.single_nat_gateway ? 1 : var.az_count
+  count = var.create_nat_gateway ? (var.single_nat_gateway ? 1 : var.az_count) : 0
 
   domain = "vpc"
   tags   = merge(var.tags, { Name = "${var.cluster_name}-nat-${count.index}" })
 }
 
 resource "aws_nat_gateway" "this" {
-  count = var.single_nat_gateway ? 1 : var.az_count
+  count = var.create_nat_gateway ? (var.single_nat_gateway ? 1 : var.az_count) : 0
 
   allocation_id = aws_eip.nat[count.index].id
   subnet_id     = aws_subnet.public[count.index].id
@@ -105,7 +105,7 @@ resource "aws_route_table_association" "public" {
 }
 
 resource "aws_route_table" "private" {
-  count = var.single_nat_gateway ? 1 : var.az_count
+  count = var.create_nat_gateway ? (var.single_nat_gateway ? 1 : var.az_count) : 0
 
   vpc_id = aws_vpc.this.id
 
@@ -117,8 +117,14 @@ resource "aws_route_table" "private" {
   tags = merge(var.tags, { Name = "${var.cluster_name}-private-rt-${count.index}" })
 }
 
+# No NAT -> no route table to associate with. The private subnets still
+# exist (some callers may want them for non-internet-bound resources) but
+# fall back to the VPC's implicit main route table, which has no outbound
+# route -- correct for this pass, since create_nat_gateway = false always
+# pairs with nodes_in_public_subnets = true (see modules/eks), so nothing
+# actually needs to run from these private subnets.
 resource "aws_route_table_association" "private" {
-  count = var.az_count
+  count = var.create_nat_gateway ? var.az_count : 0
 
   subnet_id      = aws_subnet.private[count.index].id
   route_table_id = var.single_nat_gateway ? aws_route_table.private[0].id : aws_route_table.private[count.index].id

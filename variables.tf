@@ -55,6 +55,36 @@ variable "single_nat_gateway" {
   default     = true
 }
 
+# Matches modules/network's own default (us-east-1) for the Floci path.
+# envs/prod.tfvars overrides this explicitly for whatever aws_region it
+# targets -- module.network_*'s AZ subnets must belong to the provider's
+# configured region or apply fails outright (InvalidParameterValue).
+variable "availability_zones" {
+  description = "AZs to spread subnets across, must match aws_region"
+  type        = list(string)
+  default     = ["us-east-1a", "us-east-1b", "us-east-1c"]
+}
+
+# Real-AWS-only cost cut: this deployment is provisioned for a few hours at
+# a time and destroyed right after (see the plan's burst-session design),
+# so the NAT Gateway's $0.045/hr + data processing buys security value that
+# doesn't matter here. Floci path keeps NAT (true) -- unrelated to this,
+# just the existing default preserved.
+variable "create_nat_gateway" {
+  description = "Create a NAT Gateway + private route table for the VPC"
+  type        = bool
+  default     = true
+}
+
+# Pairs with create_nat_gateway = false: nodes need a direct route to the
+# internet (pulling images, calling the EKS API) without a NAT, so they go
+# in the public subnets instead of private ones for this pass.
+variable "nodes_in_public_subnets" {
+  description = "Place the EKS node group in public subnets instead of private"
+  type        = bool
+  default     = false
+}
+
 variable "node_instance_types" {
   description = "EC2 instance types for the default EKS managed node group"
   type        = list(string)

@@ -35,6 +35,11 @@ variable "enable_irsa_addons" {
   default = false
 }
 
+variable "nodes_in_public_subnets" {
+  type    = bool
+  default = false
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

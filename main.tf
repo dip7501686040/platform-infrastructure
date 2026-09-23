@@ -1,9 +1,17 @@
 locals {
-  app_services_name     = var.clusters["app_services"].cluster_name
-  jenkins_name          = var.clusters["jenkins"].cluster_name
-  argocd_name           = var.clusters["argocd"].cluster_name
-  observability_name    = var.clusters["observability"].cluster_name
-  backing_services_name = var.clusters["backing_services"].cluster_name
+  app_services_name = var.clusters["app_services"].cluster_name
+  # try(): real AWS's clusters map only ever has "app_services" (see
+  # variables.tf) -- module.*_backing_services below are gated on
+  # var.manage_floci and never actually evaluate this when it's null, but
+  # a plain index errors during locals evaluation regardless of that gate
+  # (locals are evaluated unconditionally, before any count is resolved).
+  # This was main.tf's one real bug: applying against envs/prod.tfvars
+  # failed outright on this missing key. jenkins_name/argocd_name/
+  # observability_name locals removed entirely here -- confirmed unused
+  # anywhere in this config (Jenkins/ArgoCD/observability install as
+  # in-cluster Helm releases, not separate clusters; every install
+  # resource is already gated on manage_floci independently).
+  backing_services_name = try(var.clusters["backing_services"].cluster_name, null)
 
   # Fixed NodePorts for the two cross-cluster links this architecture needs
   # (otel-collector receiving OTLP from app_services; Prometheus scraping
@@ -230,7 +238,9 @@ module "network_app_services" {
   cluster_name       = local.app_services_name
   vpc_cidr           = var.vpc_cidr
   az_count           = var.az_count
+  availability_zones = var.availability_zones
   single_nat_gateway = var.single_nat_gateway
+  create_nat_gateway = var.create_nat_gateway
   tags               = var.tags
 }
 
@@ -238,16 +248,17 @@ module "eks_app_services" {
   source     = "./modules/eks"
   depends_on = [module.network_app_services]
 
-  cluster_name        = local.app_services_name
-  k8s_version         = var.k8s_version
-  private_subnet_ids  = module.network_app_services.private_subnet_ids
-  public_subnet_ids   = module.network_app_services.public_subnet_ids
-  node_instance_types = var.node_instance_types
-  node_desired_size   = var.node_desired_size
-  node_min_size       = var.node_min_size
-  node_max_size       = var.node_max_size
-  enable_irsa_addons  = var.enable_irsa_addons
-  tags                = var.tags
+  cluster_name            = local.app_services_name
+  k8s_version             = var.k8s_version
+  private_subnet_ids      = module.network_app_services.private_subnet_ids
+  public_subnet_ids       = module.network_app_services.public_subnet_ids
+  nodes_in_public_subnets = var.nodes_in_public_subnets
+  node_instance_types     = var.node_instance_types
+  node_desired_size       = var.node_desired_size
+  node_min_size           = var.node_min_size
+  node_max_size           = var.node_max_size
+  enable_irsa_addons      = var.enable_irsa_addons
+  tags                    = var.tags
 }
 
 module "addons_app_services" {
@@ -568,7 +579,7 @@ resource "terraform_data" "postgres_install" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       DEPLOYED_HASH=$(kubectl get statefulset postgres -n backing-services -o jsonpath='{.metadata.annotations.manifest-hash}' 2>/dev/null || true)
       READY=$(kubectl get statefulset postgres -n backing-services -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
@@ -606,7 +617,7 @@ resource "terraform_data" "rabbitmq_install" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       DEPLOYED_HASH=$(kubectl get statefulset rabbitmq -n backing-services -o jsonpath='{.metadata.annotations.manifest-hash}' 2>/dev/null || true)
       READY=$(kubectl get statefulset rabbitmq -n backing-services -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
@@ -643,7 +654,7 @@ resource "terraform_data" "redis_install" {
     interpreter = ["/bin/bash", "-c"]
     command = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       DEPLOYED_HASH=$(kubectl get deployment redis -n backing-services -o jsonpath='{.metadata.annotations.manifest-hash}' 2>/dev/null || true)
       READY=$(kubectl get deployment redis -n backing-services -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo 0)
@@ -679,7 +690,7 @@ resource "terraform_data" "backing_services_nodeports" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       cat <<SVCEOF | kubectl apply -f -
 apiVersion: v1
@@ -1045,6 +1056,7 @@ SAEOF
 
 module "network_backing_services" {
   source     = "./modules/network"
+  count      = var.manage_floci ? 1 : 0
   depends_on = [module.floci]
 
   cluster_name       = local.backing_services_name
@@ -1056,12 +1068,13 @@ module "network_backing_services" {
 
 module "eks_backing_services" {
   source     = "./modules/eks"
+  count      = var.manage_floci ? 1 : 0
   depends_on = [module.network_backing_services]
 
   cluster_name        = local.backing_services_name
   k8s_version         = var.k8s_version
-  private_subnet_ids  = module.network_backing_services.private_subnet_ids
-  public_subnet_ids   = module.network_backing_services.public_subnet_ids
+  private_subnet_ids  = module.network_backing_services[0].private_subnet_ids
+  public_subnet_ids   = module.network_backing_services[0].public_subnet_ids
   node_instance_types = var.node_instance_types
   node_desired_size   = var.node_desired_size
   node_min_size       = var.node_min_size
@@ -1072,12 +1085,13 @@ module "eks_backing_services" {
 
 module "addons_backing_services" {
   source     = "./modules/addons"
+  count      = var.manage_floci ? 1 : 0
   depends_on = [module.eks_backing_services]
 
   enable_irsa_addons = var.enable_irsa_addons
   cluster_name       = local.backing_services_name
-  oidc_provider_arn  = module.eks_backing_services.oidc_provider_arn
-  oidc_provider_url  = module.eks_backing_services.oidc_provider_url
+  oidc_provider_arn  = module.eks_backing_services[0].oidc_provider_arn
+  oidc_provider_url  = module.eks_backing_services[0].oidc_provider_url
   tags               = var.tags
 }
 
@@ -1094,7 +1108,7 @@ resource "terraform_data" "ensure_restart_policies_backing_services" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      CONTAINER="floci-eks-${module.eks_backing_services.cluster_name}"
+      CONTAINER="floci-eks-${module.eks_backing_services[0].cluster_name}"
       DESIRED_IP="${local.static_ips.backing_services}"
       docker update --restart=unless-stopped "$CONTAINER" >/dev/null
 
@@ -1179,7 +1193,7 @@ resource "terraform_data" "k8s_reconcile_backing_services" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       echo "cleaning up stale Terminating/Unknown pods..."
       kubectl get pods -A --no-headers 2>/dev/null | awk '$4=="Terminating" || $4=="Unknown"{print $2, $1}' | \
@@ -1210,7 +1224,7 @@ resource "terraform_data" "backing_services_secrets" {
     interpreter = ["/bin/bash", "-c"]
     command     = <<-EOT
       set -e
-      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services.cluster_name}" "${module.eks_backing_services.cluster_endpoint}"
+      source "${path.module}/scripts/kubeconfig.sh" "${module.eks_backing_services[0].cluster_name}" "${module.eks_backing_services[0].cluster_endpoint}"
 
       kubectl create namespace backing-services --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 

@@ -55,7 +55,12 @@ resource "aws_security_group_rule" "nodes_from_alb" {
   for_each = var.manage_floci ? {} : var.services
 
   type                     = "ingress"
-  description              = "ALB -> node NodePort for ${each.key}"
+  # AWS security group rule descriptions only allow a restricted charset
+  # (confirmed live: "->" isn't in it, ASCII "-" alone is) -- this rule's
+  # for_each is empty on the Floci path (var.manage_floci ? {} : ...), so
+  # it never actually validated against a real API until the first real
+  # AWS plan.
+  description              = "ALB to node NodePort for ${each.key}"
   from_port                = each.value.node_port
   to_port                  = each.value.node_port
   protocol                 = "tcp"

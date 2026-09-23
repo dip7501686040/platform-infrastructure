@@ -1,6 +1,7 @@
-# NOTE: aws_region is a placeholder — confirm the target region with the user
-# before running `terraform apply` against real AWS (see plan Risk #2).
-aws_region = "us-east-1"
+# Mumbai -- matches the OCI side's ap-mumbai-1, confirmed with the user
+# 2026-09-23 (changed from an earlier us-east-1 placeholder).
+aws_region         = "ap-south-1"
+availability_zones = ["ap-south-1a", "ap-south-1b", "ap-south-1c"]
 # Single-entry map, not the 4-cluster split -- Jenkins/ArgoCD/observability
 # aren't installed via Terraform on real AWS yet (every install resource in
 # main.tf is gated on var.manage_floci), so app_services is the only
@@ -22,6 +23,14 @@ backing_services_storage_class = "gp3"
 vpc_cidr           = "10.0.0.0/16"
 az_count           = 2
 single_nat_gateway = true
+
+# Burst-session design: this cluster is provisioned for a few hours at a
+# time and destroyed right after, so NAT Gateway's cost buys security
+# value that doesn't matter here. Nodes go in public subnets instead, same
+# /32-scoped security-group discipline as the OCI VCN for actual access
+# control.
+create_nat_gateway      = false
+nodes_in_public_subnets = true
 
 node_instance_types = ["t3.medium"]
 node_desired_size   = 2
