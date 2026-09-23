@@ -1,0 +1,9 @@
+{
+  "BudgetName": "ai-notification-aws-loadtest",
+  "BudgetLimit": {
+    "Amount": "20",
+    "Unit": "USD"
+  },
+  "TimeUnit": "MONTHLY",
+  "BudgetType": "COST"
+}
